@@ -2,6 +2,7 @@ import { Router } from "express";
 import { execSync } from "node:child_process";
 import { sanitizeFilename, sanitizeAsciiFilename, isYouTubeUrl, normalizeYouTubeUrl } from "../utils/validation.js";
 import { createAudioDownloadStream, getVideoInfo } from "../services/ytdlp.js";
+import { startDownload, setPhase, completeDownload, failDownload, isActive, removeDownload } from "../utils/downloadStatus.js";
 
 const router = Router();
 
@@ -18,14 +19,19 @@ router.get("/", async (req, res) => {
   }
   const normalizedUrl = normalizeYouTubeUrl(url);
   const format = String(formatParam || "best").toLowerCase().trim();
-  // Normalize aliases: high -> m4a, aac -> m4a
   const normalizedFormatForCheck = format === "high" ? "m4a" : format;
   const allowed = new Set(["best", "mp3", "m4a", "aac", "high", "opus", "wav"]);
   if (!allowed.has(format)) {
     return res.status(400).json({ error: `Unsupported audio format "${formatParam}". Supported: mp3, m4a, best` });
   }
 
-  // Get video info for title and to check availability (abortable)
+  // Prevent duplicate active audio downloads for same video + format
+  if (isActive("audio", normalizedUrl)) {
+    return res.status(429).json({ error: "An audio download for this video is already in progress. Please wait or refresh the page." });
+  }
+
+  const status = startDownload("audio", normalizedUrl);
+
   let title = "audio";
   let info = null;
   const abortController = new AbortController();
@@ -36,34 +42,39 @@ router.get("/", async (req, res) => {
   };
   req.on("close", onClientAbortInfo);
   req.on("aborted", onClientAbortInfo);
+
+  setPhase("audio", normalizedUrl, "fetching");
   try {
     info = await getVideoInfo(normalizedUrl, { signal: abortController.signal });
     if (clientAborted) {
       console.log("[audio] client aborted during info fetch");
+      removeDownload("audio", normalizedUrl);
       return;
     }
     title = info.title;
   } catch (e) {
     if (e.code === "ABORTED" || e.status === 499 || clientAborted) {
       console.log("[audio] aborted during info fetch");
+      removeDownload("audio", normalizedUrl);
       return;
     }
     const status = e.status || 500;
     const message = e.message || "Failed to retrieve video information.";
     console.error(`[audio] info fetch failed for ${normalizedUrl}:`, e.original || e.message);
+    failDownload("audio", normalizedUrl, message);
     return res.status(status).json({ error: message });
   } finally {
     try { req.off("close", onClientAbortInfo); req.off("aborted", onClientAbortInfo); } catch {}
   }
   if (clientAborted || req.destroyed || res.writableEnded) {
     console.log("[audio] client disconnected before audio download");
+    removeDownload("audio", normalizedUrl);
     return;
   }
 
   const safeName = sanitizeFilename(title);
   const asciiFallback = sanitizeAsciiFilename(safeName);
 
-  // Determine output ext and content-type, and expected size for progress
   let outputExt = format;
   let expectedSize = null;
   if (format === "best") {
@@ -114,7 +125,6 @@ router.get("/", async (req, res) => {
       res.setHeader("Content-Disposition", `attachment; filename="audio.${outputExt}"`);
     }
     res.setHeader("X-Content-Type-Options", "nosniff");
-    // Only send Content-Length when not transcoding (size known and not mp3 conversion)
     if (expectedSize && format !== "mp3") {
       res.setHeader("Content-Length", String(expectedSize));
       res.setHeader("X-Expected-Size", String(expectedSize));
@@ -124,6 +134,8 @@ router.get("/", async (req, res) => {
     res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Disposition, X-Expected-Size");
   }
 
+  setPhase("audio", normalizedUrl, "processing");
+
   let ytdlpProc, ffmpegProc, stream, isConversion;
   try {
     const result = createAudioDownloadStream(normalizedUrl, { format });
@@ -131,10 +143,9 @@ router.get("/", async (req, res) => {
     ffmpegProc = result.ffmpegProc;
     stream = result.stream;
     isConversion = result.isConversion;
-    // If best resolved to different ext via info, update outputExt handling already done
-    // For mp3 conversion, outputExt already mp3
   } catch (e) {
     console.error("[audio] create stream failed:", e.message);
+    failDownload("audio", normalizedUrl, e.message);
     if (!res.headersSent) {
       return res.status(e.status || 500).json({ error: e.message });
     }
@@ -173,6 +184,9 @@ router.get("/", async (req, res) => {
     cleaned = true;
     try { if (ytdlpProc) killTree(ytdlpProc); } catch {}
     try { if (ffmpegProc) killTree(ffmpegProc); } catch {}
+    if (!hasStartedStreaming) {
+      failDownload("audio", normalizedUrl, "Audio download cancelled");
+    }
     if (!res.writableEnded) console.log("[audio] killed procs on client disconnect");
     cleanup();
   };
@@ -182,10 +196,19 @@ router.get("/", async (req, res) => {
   req.on("error", onClose);
   res.on("close", onClose);
   res.on("error", onClose);
-  res.on("finish", () => { cleaned = true; cleanup(); });
+  res.on("finish", () => {
+    cleaned = true;
+    if (hasStartedStreaming) {
+      completeDownload("audio", normalizedUrl);
+    }
+    cleanup();
+  });
 
   stream.on("data", (chunk) => {
-    if (!headersSent) sendAudioHeaders();
+    if (!headersSent) {
+      setPhase("audio", normalizedUrl, "downloading");
+      sendAudioHeaders();
+    }
     hasStartedStreaming = true;
     try {
       const ok = res.write(chunk);
@@ -201,6 +224,7 @@ router.get("/", async (req, res) => {
 
   stream.on("error", (err) => {
     console.error("[audio] stream error", err.message);
+    failDownload("audio", normalizedUrl, err.message);
     cleanup();
     if (!headersSent && !res.headersSent) {
       res.status(500).json({ error: "Audio download failed due to streaming error." });
@@ -208,7 +232,6 @@ router.get("/", async (req, res) => {
       if (!res.writableEnded) res.end();
     }
   });
-  // Also handle ytdlp stdout errors (broken pipe when ffmpeg exits early)
   if (ytdlpProc.stdout) {
     ytdlpProc.stdout.on("error", (err) => console.error("[audio] ytdlp stdout error", err.message));
   }
@@ -228,6 +251,7 @@ router.get("/", async (req, res) => {
   });
   ytdlpProc.on("error", (err) => {
     console.error("[audio] ytdlp error", err.message);
+    failDownload("audio", normalizedUrl, err.message);
     cleanup();
     if (!headersSent && !res.headersSent) {
       res.status(500).json({ error: "Audio extraction failed." });
@@ -244,6 +268,7 @@ router.get("/", async (req, res) => {
     });
     ffmpegProc.on("error", (err) => {
       console.error("[audio] ffmpeg error", err.message);
+      failDownload("audio", normalizedUrl, err.message);
       cleanup();
       if (!headersSent && !res.headersSent) {
         res.status(500).json({ error: "Audio conversion failed (ffmpeg)." });
@@ -252,14 +277,9 @@ router.get("/", async (req, res) => {
   }
 
   function checkCompletion() {
-    // For native (no ffmpeg), ytdlp close determines completion
-    // For conversion, need both to close; ffmpeg close is final
     if (isConversion) {
-      if (ffmpegCode === null) return; // wait for ffmpeg
-      // ffmpeg is final stage
+      if (ffmpegCode === null) return;
       cleanup();
-      const lowerY = stderrYtdlp.toLowerCase();
-      const lowerF = stderrFfmpeg.toLowerCase();
       const combined = (stderrYtdlp + " " + stderrFfmpeg).toLowerCase();
 
       if (ffmpegCode === 0 && ytdlpCode === 0) {
@@ -268,13 +288,13 @@ router.get("/", async (req, res) => {
           console.log(`[audio] completed ${normalizedUrl} format=${format} hasStreamed=${hasStartedStreaming} conversion=true`);
         } else {
           console.error(`[audio] ffmpeg success but no data`, combined.slice(0,500));
+          failDownload("audio", normalizedUrl, "Audio download produced no data");
           if (!headersSent && !res.headersSent && !res.writableEnded) {
             res.status(502).json({ error: "Audio download produced no data. Please try a different format." });
           } else if (!res.writableEnded) res.end();
         }
         return;
       }
-      // Failure before streaming -> send JSON
       if (!hasStartedStreaming) {
         if (!headersSent && !res.headersSent) {
           let status = 500;
@@ -286,9 +306,9 @@ router.get("/", async (req, res) => {
           else if (combined.includes("copyright") || combined.includes("blocked")) { status = 403; message = "This video is blocked due to copyright or regional restrictions."; }
           else if (combined.includes("unsupported url")) { status = 400; message = "Unsupported URL."; }
           else if (combined.includes("http error 403") || combined.includes("forbidden")) { status = 502; message = "This audio quality is temporarily unavailable. Please try another format."; }
-          else if (combined.includes("unable to download") || lowerF.includes("conversion failed")) { status = 502; message = "Audio extraction or conversion failed."; }
-          else if (lowerF.includes("unknown encoder") || lowerF.includes("encoder.*not found")) { status = 500; message = "Audio conversion failed (ffmpeg encoder missing)."; }
+          else if (combined.includes("unable to download") || combined.toLowerCase().includes("conversion failed")) { status = 502; message = "Audio extraction or conversion failed."; }
 
+          failDownload("audio", normalizedUrl, message);
           if (!res.writableEnded) res.status(status).json({ error: message, details: (stderrYtdlp || stderrFfmpeg).slice(0, 300) });
         } else {
           if (!res.writableEnded) res.end();
@@ -297,7 +317,6 @@ router.get("/", async (req, res) => {
         if (!res.writableEnded) res.end();
       }
     } else {
-      // Native
       cleanup();
       const lower = stderrYtdlp.toLowerCase();
       if (ytdlpCode === 0) {
@@ -306,6 +325,7 @@ router.get("/", async (req, res) => {
           console.log(`[audio] completed ${normalizedUrl} format=${format} hasStreamed=${hasStartedStreaming}`);
         } else {
           console.error(`[audio] ytdlp success but no data`, lower.slice(0,500));
+          failDownload("audio", normalizedUrl, "Audio download produced no data");
           if (!headersSent && !res.headersSent && !res.writableEnded) {
             res.status(502).json({ error: "Audio download produced no data. Please try a different format." });
           } else if (!res.writableEnded) res.end();
@@ -326,6 +346,7 @@ router.get("/", async (req, res) => {
           else if (lower.includes("unsupported audio format") || lower.includes("no suitable")) { status = 400; message = `Unsupported audio format "${format}". Supported: mp3, m4a, best`; }
           else if (lower.includes("unable to download")) { status = 502; message = "Audio extraction failed."; }
 
+          failDownload("audio", normalizedUrl, message);
           if (!res.writableEnded) res.status(status).json({ error: message, details: stderrYtdlp.slice(0, 300) });
         } else {
           if (!res.writableEnded) res.end();

@@ -8,6 +8,7 @@ import infoRouter from "./routes/info.js";
 import downloadRouter from "./routes/download.js";
 import intelligenceRouter from "./routes/intelligence.js";
 import audioRouter from "./routes/audio.js";
+import { getActiveDownloads } from "./utils/downloadStatus.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,6 +35,11 @@ app.use((req, res, next) => {
 // Health
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", ytDlp: process.env.YTDLP_BIN || "yt-dlp" });
+});
+
+// Active downloads status
+app.get("/api/downloads/status", (req, res) => {
+  res.json({ downloads: getActiveDownloads() });
 });
 
 // API routes

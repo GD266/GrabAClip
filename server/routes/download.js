@@ -2,6 +2,7 @@ import { Router } from "express";
 import { execSync } from "node:child_process";
 import { validateDownloadQuery, sanitizeFilename, sanitizeAsciiFilename } from "../utils/validation.js";
 import { createDownloadStream, getVideoInfo } from "../services/ytdlp.js";
+import { startDownload, setPhase, completeDownload, failDownload, isActive, removeDownload } from "../utils/downloadStatus.js";
 
 const router = Router();
 
@@ -15,10 +16,13 @@ router.get("/", async (req, res) => {
 
   const { normalizedUrl, formatId, isHeight } = validation;
 
-  // First, get video info to derive filename and validate availability
-  // This also validates requested quality indirectly by allowing yt-dlp to handle it,
-  // but we also want to verify the format exists if possible. We use getVideoInfo as title source.
-  // If info fetch fails, propagate error.
+  // Prevent duplicate active downloads for same video + quality
+  if (isActive("video", normalizedUrl)) {
+    return res.status(429).json({ error: "A download for this video is already in progress. Please wait or refresh the page." });
+  }
+
+  const status = startDownload("video", normalizedUrl);
+
   let title = "video";
   let effectiveFormatId = formatId;
   let effectiveIsHeight = isHeight;
@@ -31,18 +35,21 @@ router.get("/", async (req, res) => {
   };
   req.on("close", onClientAbort);
   req.on("aborted", onClientAbort);
+
+  setPhase("video", normalizedUrl, "fetching");
   try {
     info = await getVideoInfo(normalizedUrl, { signal: abortController.signal });
     if (clientAborted) {
       console.log("[download] client aborted during info fetch, aborting");
+      removeDownload("video", normalizedUrl);
       return;
     }
     title = info.title;
 
-    // If formatId provided as specific id, verify it exists (if requested format is height, skip check)
     if (formatId && !isHeight) {
       const exists = info.formats.some((f) => f.formatId === formatId);
       if (!exists) {
+        failDownload("video", normalizedUrl, `Format "${formatId}" is not available.`);
         return res.status(400).json({ error: `Requested format "${formatId}" is not available. Please choose another quality.` });
       }
     }
@@ -50,15 +57,11 @@ router.get("/", async (req, res) => {
       const heightNum = parseInt(formatId, 10);
       const maxHeight = Math.max(...info.formats.map((f) => f.height), 0);
       if (heightNum > maxHeight + 100) {
-        // Requested quality higher than available, yt-dlp will fallback to best
         console.warn(`[download] requested height ${heightNum} higher than max ${maxHeight}, will fallback to best`);
       }
 
-      // Map height to actual formatId from info (prefer HLS pre-merged for reliability)
-      // Find exact height match, otherwise closest lower height, else lowest available
       let matched = info.formats.find((f) => f.height === heightNum);
       if (!matched) {
-        // Find closest lower height
         const sorted = [...info.formats].sort((a, b) => b.height - a.height);
         matched = sorted.find((f) => f.height <= heightNum) || sorted[sorted.length - 1];
         if (matched) {
@@ -70,37 +73,37 @@ router.get("/", async (req, res) => {
 
       if (matched) {
         effectiveFormatId = matched.formatId;
-        effectiveIsHeight = false; // now we have concrete format id
+        effectiveIsHeight = false;
       } else {
-        // No formats found, fallback to height selector logic
         console.warn(`[download] no format matched for height ${heightNum}, using height selector`);
       }
     }
   } catch (e) {
     if (e.code === "ABORTED" || e.status === 499 || clientAborted) {
       console.log("[download] aborted during info fetch");
+      removeDownload("video", normalizedUrl);
       return;
     }
     const status = e.status || 500;
     const message = e.message || "Failed to retrieve video information.";
     console.error(`[download] info fetch failed for ${normalizedUrl}:`, e.original || e.message);
+    failDownload("video", normalizedUrl, message);
     return res.status(status).json({ error: message });
   } finally {
-    // Remove info-phase abort listener, keep download-phase one
     try { req.off("close", onClientAbort); req.off("aborted", onClientAbort); } catch {}
   }
 
   if (clientAborted || req.destroyed || res.writableEnded) {
     console.log("[download] client already disconnected before download, aborting");
+    removeDownload("video", normalizedUrl);
     return;
   }
 
   const safeName = sanitizeFilename(title);
   const filename = `${safeName}.mp4`;
   const encoded = encodeURIComponent(filename);
-  // ASCII fallback for the quoted filename part (Node validates header as Latin1)
   const asciiFallback = sanitizeAsciiFilename(safeName);
-  // For progress: try to get filesize for selected format
+
   let expectedSize = null;
   try {
     const bestMatch = info.formats.find((f) => f.formatId === effectiveFormatId);
@@ -113,7 +116,6 @@ router.get("/", async (req, res) => {
     headersSent = true;
     res.status(200);
     res.setHeader("Content-Type", "video/mp4");
-    // Use RFC5987 for UTF-8 filename* and ASCII fallback for filename
     try {
       res.setHeader("Content-Disposition", `attachment; filename="${asciiFallback}.mp4"; filename*=UTF-8''${encoded}`);
     } catch (e) {
@@ -125,15 +127,17 @@ router.get("/", async (req, res) => {
       res.setHeader("Content-Length", String(expectedSize));
       res.setHeader("X-Expected-Size", String(expectedSize));
     }
-    // For progress: expose headers to frontend
     res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Disposition, X-Expected-Size");
   }
+
+  setPhase("video", normalizedUrl, "processing");
 
   let downloadProc;
   try {
     downloadProc = createDownloadStream(normalizedUrl, { formatId: effectiveFormatId, isHeight: effectiveIsHeight });
   } catch (e) {
     console.error("[download] create stream failed:", e.message);
+    failDownload("video", normalizedUrl, e.message);
     if (!res.headersSent) {
       return res.status(e.status || 500).json({ error: e.message });
     }
@@ -144,10 +148,8 @@ router.get("/", async (req, res) => {
   let hasStartedStreaming = false;
   let errorSent = false;
 
-  // Handle stderr for error classification
   downloadProc.stderr.on("data", (chunk) => {
     stderr += chunk.toString("utf-8");
-    // Limit stderr capture
     if (stderr.length > 8192) stderr = stderr.slice(-8192);
   });
 
@@ -173,6 +175,9 @@ router.get("/", async (req, res) => {
         console.log("[download] killed yt-dlp due to client disconnect");
       }
     } catch {}
+    if (!hasStartedStreaming) {
+      failDownload("video", normalizedUrl, "Download cancelled");
+    }
     cleanup();
   };
   const onReqAborted = () => {
@@ -186,6 +191,9 @@ router.get("/", async (req, res) => {
   res.on("error", onClose);
   res.on("finish", () => {
     cleaned = true;
+    if (hasStartedStreaming) {
+      completeDownload("video", normalizedUrl);
+    }
     cleanup();
   });
 
@@ -194,9 +202,11 @@ router.get("/", async (req, res) => {
 
   downloadProc.stdout.on("data", (chunk) => {
     lastByteTime = Date.now();
-    if (!headersSent) sendDownloadHeaders();
+    if (!headersSent) {
+      setPhase("video", normalizedUrl, "downloading");
+      sendDownloadHeaders();
+    }
     hasStartedStreaming = true;
-    // Backpressure + broken pipe handling
     try {
       const ok = res.write(chunk);
       if (!ok) {
@@ -224,18 +234,11 @@ router.get("/", async (req, res) => {
 
   downloadProc.stdout.on("end", () => {
     stdoutEnded = true;
-    // Do not end response here - wait for 'close' event to determine success/failure
-    setTimeout(() => {
-      if (stdoutEnded && !res.writableEnded && !headersSent) {
-        // No data and process hasn't closed yet? will be handled by close
-      } else if (stdoutEnded && hasStartedStreaming && !res.writableEnded) {
-        // fallback
-      }
-    }, 1000);
   });
 
   downloadProc.on("error", (err) => {
     console.error("[download] proc error:", err.message);
+    failDownload("video", normalizedUrl, err.message);
     cleanup();
     if (!headersSent && !res.headersSent) {
       res.status(500).json({ error: "Download failed due to server error." });
@@ -251,12 +254,11 @@ router.get("/", async (req, res) => {
     const lower = stderr.toLowerCase();
 
     if (code === 0) {
-      // Success - ensure response ends
       if (hasStartedStreaming) {
         if (!res.writableEnded) res.end();
       } else {
-        // No data streamed but exit 0 - treat as empty download error
         console.error(`[download] yt-dlp exited 0 but no data streamed:`, stderr.slice(0, 500));
+        failDownload("video", normalizedUrl, "Download produced no data");
         if (!headersSent && !res.headersSent && !res.writableEnded) {
           res.status(502).json({ error: "Download produced no data. Please try a different quality." });
         } else if (!res.writableEnded) {
@@ -267,39 +269,36 @@ router.get("/", async (req, res) => {
       return;
     }
 
-    // Failure case (code !==0)
     console.error(`[download] yt-dlp exited code ${code}:`, stderr.slice(0, 500));
 
-      if (!hasStartedStreaming) {
-        // No bytes streamed at all - we can still send proper JSON error if headers not yet sent
-        if (!headersSent && !res.headersSent) {
-          // Classify error - order matters: auth before generic 403
-          let status = 500;
-          let message = "Download failed. Please try again.";
-          if (lower.includes("video unavailable")) { status = 404; message = "Video unavailable."; }
-          else if (lower.includes("private video")) { status = 403; message = "This video is private."; }
-          else if (
-            lower.includes("confirm your age") ||
-            lower.includes("age-restricted") ||
-            lower.includes("age restricted") ||
-            lower.includes("inappropriate for some users") ||
-            (lower.includes("sign in") && lower.includes("age")) ||
-            lower.includes("login required") ||
-            lower.includes("requires authentication")
-          ) { status = 403; message = "This video is age-restricted or requires sign-in."; }
-          else if (lower.includes("members-only") || lower.includes("members only") || lower.includes("join this channel")) { status = 403; message = "This video is members-only or requires purchase."; }
-          else if (lower.includes("copyright") || lower.includes("blocked")) { status = 403; message = "This video is blocked due to copyright or regional restrictions."; }
-          else if (lower.includes("requested format not available") || lower.includes("format not found")) { status = 400; message = "Requested quality not available. Please choose another quality."; }
-          else if (lower.includes("unsupported url")) { status = 400; message = "Unsupported URL."; }
-          else if (lower.includes("http error 403") || lower.includes("forbidden")) { status = 502; message = "This quality is temporarily unavailable (403). Please try a different quality (e.g., 720p or 480p)."; }
-          else if (lower.includes("unable to download")) { status = 502; message = "Failed to download video data. Please try a different quality."; }
+    if (!hasStartedStreaming) {
+      if (!headersSent && !res.headersSent) {
+        let status = 500;
+        let message = "Download failed. Please try again.";
+        if (lower.includes("video unavailable")) { status = 404; message = "Video unavailable."; }
+        else if (lower.includes("private video")) { status = 403; message = "This video is private."; }
+        else if (
+          lower.includes("confirm your age") ||
+          lower.includes("age-restricted") ||
+          lower.includes("age restricted") ||
+          lower.includes("inappropriate for some users") ||
+          (lower.includes("sign in") && lower.includes("age")) ||
+          lower.includes("login required") ||
+          lower.includes("requires authentication")
+        ) { status = 403; message = "This video is age-restricted or requires sign-in."; }
+        else if (lower.includes("members-only") || lower.includes("members only") || lower.includes("join this channel")) { status = 403; message = "This video is members-only or requires purchase."; }
+        else if (lower.includes("copyright") || lower.includes("blocked")) { status = 403; message = "This video is blocked due to copyright or regional restrictions."; }
+        else if (lower.includes("requested format not available") || lower.includes("format not found")) { status = 400; message = "Requested quality not available. Please choose another quality."; }
+        else if (lower.includes("unsupported url")) { status = 400; message = "Unsupported URL."; }
+        else if (lower.includes("http error 403") || lower.includes("forbidden")) { status = 502; message = "This quality is temporarily unavailable (403). Please try a different quality (e.g., 720p or 480p)."; }
+        else if (lower.includes("unable to download")) { status = 502; message = "Failed to download video data. Please try a different quality."; }
 
-          if (!res.writableEnded) res.status(status).json({ error: message, details: stderr.slice(0, 300) });
-        } else {
-          if (!res.writableEnded) res.end();
-        }
+        failDownload("video", normalizedUrl, message);
+        if (!res.writableEnded) res.status(status).json({ error: message, details: stderr.slice(0, 300) });
+      } else {
+        if (!res.writableEnded) res.end();
+      }
     } else {
-      // Partial stream already sent, just end (client may have partial file)
       if (!res.writableEnded) res.end();
     }
   });
@@ -307,13 +306,7 @@ router.get("/", async (req, res) => {
   function cleanup() {
     req.off("close", onClose);
     res.off("close", onClose);
-    // Ensure proc killed if still alive and response ended
-    if (res.writableEnded && downloadProc && !downloadProc.killed) {
-      // No need to kill if naturally ended, but ensure
-    }
   }
-
-  // Note: We already started streaming via stdout 'data' handler. No pipe needed.
 });
 
 export default router;

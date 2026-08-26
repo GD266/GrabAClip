@@ -72,6 +72,20 @@ button:disabled {
   cursor: not-allowed;
 }
 
+.cancel-btn {
+  background: #e74c3c;
+  padding: 10px 14px;
+}
+
+.cancel-btn:hover:not(:disabled) {
+  background: #c0392b;
+}
+
+.cancel-btn:disabled {
+  background: #e8a9a2;
+  cursor: not-allowed;
+}
+
 hr {
   margin: 16px 0;
   border: none;

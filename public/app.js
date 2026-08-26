@@ -1,4 +1,4 @@
-// Frontend logic for Grab a Clip - Phase 1
+// Frontend logic for Grab a Clip - Phase 4
 
 const urlInput = document.getElementById("urlInput");
 const getVideoBtn = document.getElementById("getVideoBtn");
@@ -35,6 +35,9 @@ const audioSection = document.getElementById("audioSection");
 const audioQualitySelect = document.getElementById("audioQualitySelect");
 const downloadAudioBtn = document.getElementById("downloadAudioBtn");
 const audioStatusEl = document.getElementById("audioStatus");
+
+const cancelVideoBtn = document.getElementById("cancelVideoBtn");
+const cancelAudioBtn = document.getElementById("cancelAudioBtn");
 
 let currentUrl = "";
 let currentFormats = [];
@@ -102,6 +105,22 @@ function formatBytes(bytes) {
   return `~${(bytes / 1024).toFixed(0)} KB`;
 }
 
+function formatBytesProgress(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Phase labels for display
+const PHASE_LABELS = {
+  preparing: "Preparing...",
+  fetching: "Fetching video...",
+  processing: "Processing...",
+  downloading: "Downloading...",
+  complete: "Complete",
+  failed: "Failed",
+};
+
 async function getVideo() {
   const url = urlInput.value.trim();
 
@@ -133,7 +152,6 @@ async function getVideo() {
       throw new Error(data.error || "Failed to retrieve video information.");
     }
 
-    // Display info
     currentUrl = url;
     currentFormats = data.formats || [];
     currentAudioFormats = data.audioFormats || [];
@@ -163,24 +181,20 @@ async function getVideo() {
       opt.textContent = "Best available (no alternatives found)";
       qualitySelect.appendChild(opt);
     } else {
-      // Sort desc by height already, but ensure
       currentFormats.sort((a, b) => b.height - a.height);
       for (const f of currentFormats) {
         const opt = document.createElement("option");
         opt.value = f.formatId;
-        // Human readable: 720p - mp4 (with audio) + filesize
         const sizeStr = f.filesize ? ` ${formatBytes(f.filesize)}` : "";
         const audioNote = f.hasAudio ? "" : " (merges audio)";
         opt.textContent = `${f.height}p - ${f.ext}${audioNote}${sizeStr}`;
-        // Store data for later
         opt.dataset.height = f.height;
         opt.dataset.label = f.label;
         qualitySelect.appendChild(opt);
       }
-      // Add "Best" option at top? Keep highest as default (720/1080). The API fallback handles best.
     }
 
-    // Populate audio selector (small user-friendly selection)
+    // Populate audio selector
     if (audioQualitySelect) {
       audioQualitySelect.innerHTML = "";
       if (currentAudioFormats.length === 0) {
@@ -191,7 +205,7 @@ async function getVideo() {
       } else {
         for (const a of currentAudioFormats) {
           const opt = document.createElement("option");
-          opt.value = a.id; // best, m4a, mp3
+          opt.value = a.id;
           opt.textContent = a.displayLabel;
           audioQualitySelect.appendChild(opt);
         }
@@ -246,16 +260,13 @@ async function getIntelligence() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Intelligence failed");
-    // Update expanded info if available (in case user didn't click Get Video)
     if (data.video) {
       if (vUploadDateEl && data.video.uploadDateFormatted) vUploadDateEl.textContent = data.video.uploadDateFormatted;
       if (vViewsEl && data.video.viewCount != null) vViewsEl.textContent = Number(data.video.viewCount).toLocaleString();
       if (vLikesEl && data.video.likeCount != null) vLikesEl.textContent = Number(data.video.likeCount).toLocaleString();
       if (vDescriptionEl && data.video.description) vDescriptionEl.textContent = data.video.description;
     }
-    // Show content
     intelligenceContentEl.classList.remove("hidden");
-    // Transcript
     if (data.transcript?.available) {
       setStatus(transcriptStatusEl, `Transcript available (${data.transcript.language || "en"}${data.transcript.isAuto ? ", auto" : ", manual"}) — ${data.transcript.text.length} chars`, "success");
       transcriptTextEl.textContent = data.transcript.text.slice(0, 8000) + (data.transcript.text.length > 8000 ? "\n...[truncated]" : "");
@@ -263,7 +274,6 @@ async function getIntelligence() {
       setStatus(transcriptStatusEl, data.transcript?.error || "Transcript unavailable", "error");
       transcriptTextEl.textContent = "";
     }
-    // About / AI
     if (data.intelligence?.aboutVideo) {
       aiOverviewEl.textContent = data.intelligence.aboutVideo.overview || "—";
       aiTopicsEl.innerHTML = "";
@@ -294,18 +304,111 @@ async function getIntelligence() {
   }
 }
 
+// ========== Phase 4: Download State Management ==========
+
 let isDownloadingVideo = false;
 let isDownloadingAudio = false;
 let currentAbortController = null;
+let videoPollInterval = null;
+let audioPollInterval = null;
 
-function formatBytesProgress(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+function setDownloadControlsDownloading(type) {
+  if (type === "video") {
+    isDownloadingVideo = true;
+    currentAbortController = new AbortController();
+    downloadBtn.disabled = true;
+    downloadBtn.textContent = "Preparing...";
+    qualitySelect.disabled = true;
+    if (cancelVideoBtn) cancelVideoBtn.classList.remove("hidden");
+    if (downloadAudioBtn) downloadAudioBtn.disabled = true;
+    if (audioQualitySelect) audioQualitySelect.disabled = true;
+  } else {
+    isDownloadingAudio = true;
+    currentAbortController = new AbortController();
+    downloadAudioBtn.disabled = true;
+    downloadAudioBtn.textContent = "Preparing...";
+    if (audioQualitySelect) audioQualitySelect.disabled = true;
+    if (cancelAudioBtn) cancelAudioBtn.classList.remove("hidden");
+    downloadBtn.disabled = true;
+    if (qualitySelect) qualitySelect.disabled = true;
+  }
 }
 
+function setDownloadControlsIdle(type) {
+  if (type === "video") {
+    isDownloadingVideo = false;
+    currentAbortController = null;
+    downloadBtn.disabled = false;
+    downloadBtn.textContent = "Download";
+    qualitySelect.disabled = false;
+    if (cancelVideoBtn) cancelVideoBtn.classList.add("hidden");
+    if (downloadAudioBtn) downloadAudioBtn.disabled = false;
+    if (audioQualitySelect) audioQualitySelect.disabled = false;
+  } else {
+    isDownloadingAudio = false;
+    currentAbortController = null;
+    downloadAudioBtn.disabled = false;
+    downloadAudioBtn.textContent = "Download Audio";
+    if (audioQualitySelect) audioQualitySelect.disabled = false;
+    if (cancelAudioBtn) cancelAudioBtn.classList.add("hidden");
+    downloadBtn.disabled = false;
+    if (qualitySelect) qualitySelect.disabled = false;
+  }
+}
+
+function startPolling(type, url, statusEl) {
+  const interval = setInterval(async () => {
+    try {
+      const res = await fetch("/api/downloads/status");
+      if (!res.ok) return;
+      const data = await res.json();
+      const active = data.downloads.find((d) => d.type === type && d.url === url);
+      if (active) {
+        const label = PHASE_LABELS[active.phase] || active.phase;
+        const typeClass = active.phase === "failed" ? "error" : active.phase === "complete" ? "success" : "loading";
+        setStatus(statusEl, label, typeClass);
+
+        if (active.phase === "complete" || active.phase === "failed") {
+          stopPolling(type);
+          if (active.phase === "failed") {
+            // Don't reset controls yet - show error, let user retry
+          }
+        }
+      }
+    } catch {}
+  }, 500);
+
+  if (type === "video") videoPollInterval = interval;
+  else audioPollInterval = interval;
+}
+
+function stopPolling(type) {
+  if (type === "video" && videoPollInterval) {
+    clearInterval(videoPollInterval);
+    videoPollInterval = null;
+  } else if (type === "audio" && audioPollInterval) {
+    clearInterval(audioPollInterval);
+    audioPollInterval = null;
+  }
+}
+
+function cancelDownload(type) {
+  if (type === "video" && currentAbortController) {
+    currentAbortController.abort();
+    stopPolling("video");
+    setDownloadControlsIdle("video");
+    setStatus(downloadStatusEl, "Download cancelled.", "error");
+  } else if (type === "audio" && currentAbortController) {
+    currentAbortController.abort();
+    stopPolling("audio");
+    setDownloadControlsIdle("audio");
+    setStatus(audioStatusEl, "Audio download cancelled.", "error");
+  }
+}
+
+// ========== Phase 4: Download with Progress ==========
+
 async function downloadWithProgress(url, statusEl, onProgress) {
-  // Use fetch with ReadableStream for progress without buffering entire file in one go
   const response = await fetch(url, { signal: currentAbortController?.signal });
   const contentType = response.headers.get("content-type") || "";
   if (!response.ok) {
@@ -328,7 +431,6 @@ async function downloadWithProgress(url, statusEl, onProgress) {
     throw new Error("Unexpected response. Expected file.");
   }
 
-  // Try to get filename
   let filename = null;
   const disposition = response.headers.get("content-disposition");
   if (disposition) {
@@ -355,9 +457,7 @@ async function downloadWithProgress(url, statusEl, onProgress) {
       if (onProgress) onProgress(received, total);
     }
   }
-  // Combine chunks into blob
   const blob = new Blob(chunks, { type: contentType || "application/octet-stream" });
-  // Try to get filename from disposition if not already
   if (!filename) {
     const ct = contentType.includes("video") ? "video.mp4" : contentType.includes("audio") ? "audio.m4a" : "download";
     filename = ct;
@@ -372,22 +472,14 @@ async function downloadVideo() {
     return;
   }
   const selectedFormatId = qualitySelect.value || null;
-  isDownloadingVideo = true;
-  currentAbortController = new AbortController();
-  // Prevent duplicate, disable controls
-  downloadBtn.disabled = true;
-  downloadBtn.textContent = "Preparing...";
-  qualitySelect.disabled = true;
-  if (downloadAudioBtn) downloadAudioBtn.disabled = true;
-  if (audioQualitySelect) audioQualitySelect.disabled = true;
+  setDownloadControlsDownloading("video");
+  startPolling("video", currentUrl, downloadStatusEl);
   setStatus(downloadStatusEl, "Preparing...", "loading");
+
   try {
-    await new Promise(r => setTimeout(r, 200));
-    setStatus(downloadStatusEl, "Fetching video...", "loading");
     const params = new URLSearchParams({ url: currentUrl });
     if (selectedFormatId) params.set("formatId", selectedFormatId);
     const downloadUrl = `/api/download?${params.toString()}`;
-    setStatus(downloadStatusEl, "Processing...", "loading");
     const { blob, filename } = await downloadWithProgress(downloadUrl, downloadStatusEl, (received, total) => {
       if (total) {
         const pct = Math.round((received / total) * 100);
@@ -413,13 +505,8 @@ async function downloadVideo() {
       setStatus(downloadStatusEl, err.message || "Download failed.", "error");
     }
   } finally {
-    isDownloadingVideo = false;
-    currentAbortController = null;
-    downloadBtn.disabled = false;
-    downloadBtn.textContent = "Download";
-    qualitySelect.disabled = false;
-    if (downloadAudioBtn) downloadAudioBtn.disabled = false;
-    if (audioQualitySelect) audioQualitySelect.disabled = false;
+    stopPolling("video");
+    setDownloadControlsIdle("video");
   }
 }
 
@@ -431,20 +518,13 @@ async function downloadAudio() {
   }
   const selected = audioQualitySelect ? audioQualitySelect.value : "best";
   const format = selected || "best";
-  isDownloadingAudio = true;
-  currentAbortController = new AbortController();
-  downloadAudioBtn.disabled = true;
-  downloadAudioBtn.textContent = "Preparing...";
-  if (audioQualitySelect) audioQualitySelect.disabled = true;
-  downloadBtn.disabled = true;
-  if (qualitySelect) qualitySelect.disabled = true;
+  setDownloadControlsDownloading("audio");
+  startPolling("audio", currentUrl, audioStatusEl);
   setStatus(audioStatusEl, "Preparing...", "loading");
+
   try {
-    await new Promise(r => setTimeout(r, 150));
-    setStatus(audioStatusEl, "Fetching audio...", "loading");
     const params = new URLSearchParams({ url: currentUrl, format });
     const downloadUrl = `/api/download/audio?${params.toString()}`;
-    setStatus(audioStatusEl, "Processing...", "loading");
     const { blob, filename } = await downloadWithProgress(downloadUrl, audioStatusEl, (received, total) => {
       if (total) {
         const pct = Math.round((received / total) * 100);
@@ -467,17 +547,13 @@ async function downloadAudio() {
     if (err.name === "AbortError") setStatus(audioStatusEl, "Audio download cancelled.", "error");
     else setStatus(audioStatusEl, err.message || "Audio download failed.", "error");
   } finally {
-    isDownloadingAudio = false;
-    currentAbortController = null;
-    downloadAudioBtn.disabled = false;
-    downloadAudioBtn.textContent = "Download Audio";
-    if (audioQualitySelect) audioQualitySelect.disabled = false;
-    downloadBtn.disabled = false;
-    if (qualitySelect) qualitySelect.disabled = false;
+    stopPolling("audio");
+    setDownloadControlsIdle("audio");
   }
 }
 
-// Events
+// ========== Event Listeners ==========
+
 getVideoBtn.addEventListener("click", getVideo);
 urlInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") getVideo();
@@ -485,6 +561,8 @@ urlInput.addEventListener("keydown", (e) => {
 downloadBtn.addEventListener("click", downloadVideo);
 if (downloadAudioBtn) downloadAudioBtn.addEventListener("click", downloadAudio);
 if (getIntelligenceBtn) getIntelligenceBtn.addEventListener("click", getIntelligence);
+if (cancelVideoBtn) cancelVideoBtn.addEventListener("click", () => cancelDownload("video"));
+if (cancelAudioBtn) cancelAudioBtn.addEventListener("click", () => cancelDownload("audio"));
 
 // Auto-clear status on input
 urlInput.addEventListener("input", () => {
