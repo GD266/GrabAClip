@@ -30,8 +30,15 @@ const aiKeyPointsEl = document.getElementById("aiKeyPoints");
 const aiProviderEl = document.getElementById("aiProvider");
 const aiErrorEl = document.getElementById("aiError");
 
+// Phase 3 elements
+const audioSection = document.getElementById("audioSection");
+const audioQualitySelect = document.getElementById("audioQualitySelect");
+const downloadAudioBtn = document.getElementById("downloadAudioBtn");
+const audioStatusEl = document.getElementById("audioStatus");
+
 let currentUrl = "";
 let currentFormats = [];
+let currentAudioFormats = [];
 
 // Inline YouTube validator (mirrors shared/validator.js)
 function extractVideoId(urlString) {
@@ -129,6 +136,7 @@ async function getVideo() {
     // Display info
     currentUrl = url;
     currentFormats = data.formats || [];
+    currentAudioFormats = data.audioFormats || [];
 
     vTitleEl.textContent = data.title || "Untitled";
     vChannelEl.textContent = data.channel || "Unknown";
@@ -172,7 +180,26 @@ async function getVideo() {
       // Add "Best" option at top? Keep highest as default (720/1080). The API fallback handles best.
     }
 
+    // Populate audio selector (small user-friendly selection)
+    if (audioQualitySelect) {
+      audioQualitySelect.innerHTML = "";
+      if (currentAudioFormats.length === 0) {
+        const opt = document.createElement("option");
+        opt.value = "best";
+        opt.textContent = "Best audio (no alternatives)";
+        audioQualitySelect.appendChild(opt);
+      } else {
+        for (const a of currentAudioFormats) {
+          const opt = document.createElement("option");
+          opt.value = a.id; // best, m4a, mp3
+          opt.textContent = a.displayLabel;
+          audioQualitySelect.appendChild(opt);
+        }
+      }
+    }
+
     videoSection.classList.remove("hidden");
+    if (audioSection) audioSection.classList.remove("hidden");
     if (intelligenceSection) intelligenceSection.classList.remove("hidden");
     setStatus(statusEl, "Video found. Choose quality and download.", "success");
     // Reset intelligence UI for new video
@@ -184,9 +211,11 @@ async function getVideo() {
     if (aiKeyPointsEl) aiKeyPointsEl.innerHTML = "";
     if (aiProviderEl) aiProviderEl.textContent = "";
     if (aiErrorEl) setStatus(aiErrorEl, "", "");
+    if (audioStatusEl) setStatus(audioStatusEl, "", "");
   } catch (err) {
     setStatus(statusEl, err.message || "An error occurred.", "error");
     videoSection.classList.add("hidden");
+    if (audioSection) audioSection.classList.add("hidden");
     if (intelligenceSection) intelligenceSection.classList.add("hidden");
   } finally {
     getVideoBtn.disabled = false;
@@ -361,12 +390,68 @@ async function downloadVideo() {
   }
 }
 
+async function downloadAudio() {
+  if (!currentUrl) {
+    setStatus(audioStatusEl, "No video selected. Fetch video first.", "error");
+    return;
+  }
+  const selected = audioQualitySelect ? audioQualitySelect.value : "best";
+  const format = selected || "best";
+  setStatus(audioStatusEl, `Starting audio download (${format})...`, "loading");
+  downloadAudioBtn.disabled = true;
+  downloadAudioBtn.textContent = "Downloading...";
+  try {
+    const params = new URLSearchParams({ url: currentUrl, format });
+    const res = await fetch(`/api/download/audio?${params.toString()}`, { method: "GET" });
+    const contentType = res.headers.get("content-type") || "";
+    if (!res.ok) {
+      if (contentType.includes("application/json")) {
+        const errData = await res.json();
+        throw new Error(errData.error || `Audio download failed (${res.status})`);
+      } else {
+        const text = await res.text();
+        try { const j = JSON.parse(text); throw new Error(j.error || `Audio download failed (${res.status})`); } catch { throw new Error(`Audio download failed (${res.status}). ${text.slice(0,200)}`); }
+      }
+    }
+    if (contentType.includes("application/json")) {
+      const maybeError = await res.json();
+      if (maybeError.error) throw new Error(maybeError.error);
+      throw new Error("Unexpected response. Expected audio file.");
+    }
+    let filename = `audio.${format === "mp3" ? "mp3" : format === "m4a" ? "m4a" : "m4a"}`;
+    const disposition = res.headers.get("content-disposition");
+    if (disposition) {
+      const match = disposition.match(/filename\*?=(?:UTF-8''?)?["']?([^"';\n]+)["']?/i);
+      if (match) {
+        try { filename = decodeURIComponent(match[1].replace(/"/g, "")); } catch { filename = match[1]; }
+      }
+    }
+    const blob = await res.blob();
+    if (blob.size === 0) throw new Error("Downloaded audio is empty. Try another format.");
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    setStatus(audioStatusEl, `Audio download started: ${filename} (${(blob.size/(1024*1024)).toFixed(1)} MB)`, "success");
+  } catch (err) {
+    setStatus(audioStatusEl, err.message || "Audio download failed.", "error");
+  } finally {
+    downloadAudioBtn.disabled = false;
+    downloadAudioBtn.textContent = "Download Audio";
+  }
+}
+
 // Events
 getVideoBtn.addEventListener("click", getVideo);
 urlInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") getVideo();
 });
 downloadBtn.addEventListener("click", downloadVideo);
+if (downloadAudioBtn) downloadAudioBtn.addEventListener("click", downloadAudio);
 if (getIntelligenceBtn) getIntelligenceBtn.addEventListener("click", getIntelligence);
 
 // Auto-clear status on input

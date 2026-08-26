@@ -30,6 +30,7 @@ router.post("/", async (req, res) => {
       likeCount: info.likeCount,
       description: info.description,
       formats: info.formats,
+      audioFormats: info.audioFormats,
     });
   } catch (e) {
     const status = e.status || 500;

@@ -195,6 +195,90 @@ function buildFormats(rawFormats) {
   }));
 }
 
+export function buildAudioFormats(rawFormats) {
+  if (!Array.isArray(rawFormats)) return [];
+
+  // Filter audio-only: vcodec none, acodec present
+  const audioOnly = rawFormats.filter(
+    (f) => (!f.vcodec || f.vcodec === "none") && f.acodec && f.acodec !== "none" && f.format_id && f.ext
+  );
+
+  if (audioOnly.length === 0) return [];
+
+  // Helper to find best by abr/tbr
+  const bestOverall = [...audioOnly].sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
+  const bestM4a = [...audioOnly]
+    .filter((f) => f.ext === "m4a")
+    .sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
+  const bestOpus = [...audioOnly]
+    .filter((f) => f.ext === "webm" || f.acodec?.toLowerCase().includes("opus"))
+    .sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
+
+  const normalized = [];
+
+  // Best (native, keep original ext)
+  if (bestOverall) {
+    normalized.push({
+      id: "best",
+      formatId: bestOverall.format_id,
+      ext: bestOverall.ext,
+      acodec: bestOverall.acodec,
+      abr: bestOverall.abr || bestOverall.tbr || null,
+      filesize: bestOverall.filesize || bestOverall.filesize_approx || null,
+      label: "Best",
+      displayLabel: `Best - ${bestOverall.ext} (${Math.round(bestOverall.abr || bestOverall.tbr || 0)}k)`,
+      isConversion: false,
+    });
+  }
+
+  // M4A native where available
+  if (bestM4a && bestM4a.format_id !== bestOverall?.format_id) {
+    normalized.push({
+      id: "m4a",
+      formatId: bestM4a.format_id,
+      ext: "m4a",
+      acodec: bestM4a.acodec,
+      abr: bestM4a.abr || bestM4a.tbr || null,
+      filesize: bestM4a.filesize || bestM4a.filesize_approx || null,
+      label: "M4A",
+      displayLabel: `M4A - AAC (${Math.round(bestM4a.abr || bestM4a.tbr || 0)}k)`,
+      isConversion: false,
+    });
+  } else if (bestM4a && normalized.length === 0) {
+    // fallback: if bestOverall is m4a, still expose m4a as explicit
+    normalized.push({
+      id: "m4a",
+      formatId: bestM4a.format_id,
+      ext: "m4a",
+      acodec: bestM4a.acodec,
+      abr: bestM4a.abr || bestM4a.tbr || null,
+      filesize: bestM4a.filesize || bestM4a.filesize_approx || null,
+      label: "M4A",
+      displayLabel: `M4A - AAC (${Math.round(bestM4a.abr || bestM4a.tbr || 0)}k)`,
+      isConversion: false,
+    });
+  } else if (!bestM4a && bestOverall) {
+    // No native m4a, but we can offer m4a via conversion? But spec says M4A where available, so skip if not available
+  }
+
+  // MP3 via ffmpeg conversion (always available as conversion from best)
+  normalized.push({
+    id: "mp3",
+    formatId: "mp3", // special, will be handled as conversion
+    ext: "mp3",
+    acodec: "mp3",
+    abr: 192,
+    filesize: null,
+    label: "MP3",
+    displayLabel: "MP3 - Converted (192k)",
+    isConversion: true,
+  });
+
+  // Deduplicate by ext if best is already mp3? best is never mp3 natively (yt provides m4a/webm), so mp3 remains distinct.
+
+  return normalized;
+}
+
 export async function getVideoInfo(rawUrl) {
   if (!isYouTubeUrl(rawUrl)) {
     const err = new Error("Invalid YouTube URL");
@@ -273,6 +357,7 @@ export async function getVideoInfo(rawUrl) {
 
   // Build formats
   const formats = buildFormats(data.formats);
+  const audioFormats = buildAudioFormats(data.formats);
 
   if (formats.length === 0) {
     // Fallback: at least offer some common qualities if raw formats empty but we have height?
@@ -294,6 +379,7 @@ export async function getVideoInfo(rawUrl) {
     uploadDate,
     uploadDateFormatted,
     formats,
+    audioFormats,
     // extra for debugging but not exposed? keep internal
     _rawTitle: title,
     _rawData: {
@@ -367,6 +453,163 @@ export function createDownloadStream(rawUrl, options = {}) {
   proc.on("error", () => clearTimeout(timeout));
 
   return proc;
+}
+
+/**
+ * Create audio download stream
+ * Supports: best (native), m4a (native), mp3 (via ffmpeg conversion)
+ * Returns object { ytdlpProc, ffmpegProc, stream, cleanup, isConversion }
+ */
+export function createAudioDownloadStream(rawUrl, options = {}) {
+  const { format = "best" } = options; // mp3, m4a, best
+
+  if (!isYouTubeUrl(rawUrl)) {
+    const err = new Error("Invalid YouTube URL");
+    err.status = 400;
+    throw err;
+  }
+  const url = normalizeYouTubeUrl(rawUrl);
+
+  const normalizedFormat = String(format).toLowerCase().trim();
+  const allowed = new Set(["best", "mp3", "m4a", "aac", "opus", "wav"]);
+  if (!allowed.has(normalizedFormat)) {
+    const err = new Error(`Unsupported audio format "${format}". Supported: mp3, m4a, best`);
+    err.status = 400;
+    throw err;
+  }
+
+  // Determine yt-dlp format selector and output handling
+  // For audio, direct bestaudio often fails with SABR 403 (https DASH). Use HLS video (91-96) as reliable source and extract audio via ffmpeg.
+  // This preserves the HLS fallback used for video and avoids unnecessary re-encode when possible.
+  let ytdlpFormat;
+  let needsConversion = false;
+  let outputExt = normalizedFormat;
+  let ffmpegArgs = null;
+
+  // HLS video source: try smallest HLS first (91) then larger, fallback to best
+  const hlsFallback = "91/92/93/94/95/96/best";
+
+  if (normalizedFormat === "mp3") {
+    // Use HLS video -> transcode to mp3 192k
+    ytdlpFormat = hlsFallback;
+    needsConversion = true;
+    outputExt = "mp3";
+    ffmpegArgs = [
+      "-i", "pipe:0",
+      "-vn",
+      "-c:a", "libmp3lame",
+      "-b:a", "192k",
+      "-f", "mp3",
+      "pipe:1",
+    ];
+  } else if (normalizedFormat === "m4a" || normalizedFormat === "aac") {
+    // Use HLS video -> extract aac to m4a (fragmented mp4, no re-encode where possible)
+    ytdlpFormat = hlsFallback;
+    outputExt = "m4a";
+    needsConversion = true;
+    ffmpegArgs = [
+      "-i", "pipe:0",
+      "-vn",
+      "-c:a", "copy",
+      "-bsf:a", "aac_adtstoasc",
+      "-f", "mp4",
+      "-movflags", "frag_keyframe+empty_moov",
+      "pipe:1",
+    ];
+    // Fallback to re-encode if copy fails: ffmpeg will handle, but we use copy for efficiency
+  } else if (normalizedFormat === "opus") {
+    ytdlpFormat = "bestaudio[ext=webm]/bestaudio";
+    outputExt = "webm";
+    needsConversion = false;
+  } else {
+    // best - use HLS video and extract best available audio without re-encode if possible
+    // For best, we can offer m4a via copy from HLS (most compatible)
+    ytdlpFormat = hlsFallback;
+    outputExt = "m4a";
+    needsConversion = true;
+    ffmpegArgs = [
+      "-i", "pipe:0",
+      "-vn",
+      "-c:a", "copy",
+      "-bsf:a", "aac_adtstoasc",
+      "-f", "mp4",
+      "-movflags", "frag_keyframe+empty_moov",
+      "pipe:1",
+    ];
+  }
+
+  const ytdlpArgs = [
+    "--no-playlist",
+    "--remote-components",
+    "ejs:github",
+    "-f",
+    ytdlpFormat,
+    "--no-warnings",
+    "--no-progress",
+    "--socket-timeout",
+    "20",
+    "--retries",
+    "2",
+    "-o",
+    "-",
+    url,
+  ];
+
+  // For native m4a/best, we can try to keep original but if best is webm, we still stream webm
+  // No ffmpeg needed, just yt-dlp stdout
+
+  const ytdlpProc = spawn(YTDLP_BIN, ytdlpArgs, {
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+
+  let ffmpegProc = null;
+  let stream = ytdlpProc.stdout;
+
+  if (needsConversion) {
+    // Spawn ffmpeg to convert pipe:0 -> mp3 pipe:1
+    const FFMPEG_BIN = process.env.FFMPEG_BIN || "ffmpeg";
+    ffmpegProc = spawn(FFMPEG_BIN, ffmpegArgs, {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    // Pipe yt-dlp stdout to ffmpeg stdin
+    ytdlpProc.stdout.pipe(ffmpegProc.stdin);
+
+    // Handle ffmpeg errors: if ffmpeg fails, kill ytdlp
+    ffmpegProc.on("error", (err) => {
+      ytdlpProc.kill("SIGKILL");
+    });
+    ytdlpProc.on("error", () => {
+      try { ffmpegProc.kill("SIGKILL"); } catch {}
+    });
+
+    stream = ffmpegProc.stdout;
+
+    // Timeout for whole pipeline
+    const timeout = setTimeout(() => {
+      try { ytdlpProc.kill("SIGKILL"); } catch {}
+      try { ffmpegProc.kill("SIGKILL"); } catch {}
+    }, DOWNLOAD_TIMEOUT_MS);
+
+    const clear = () => clearTimeout(timeout);
+    ytdlpProc.on("close", clear);
+    ffmpegProc.on("close", clear);
+    ffmpegProc.on("error", clear);
+    ytdlpProc.on("error", clear);
+
+    return { ytdlpProc, ffmpegProc, stream, isConversion: true, outputExt };
+  }
+
+  // Native - timeout handling
+  const timeout = setTimeout(() => {
+    try { ytdlpProc.kill("SIGKILL"); } catch {}
+  }, DOWNLOAD_TIMEOUT_MS);
+  ytdlpProc.on("close", () => clearTimeout(timeout));
+  ytdlpProc.on("error", () => clearTimeout(timeout));
+
+  return { ytdlpProc, ffmpegProc: null, stream, isConversion: false, outputExt };
 }
 
 /**
