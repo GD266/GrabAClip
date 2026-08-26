@@ -1,0 +1,73 @@
+Grab a Clip server running at http://localhost:3000
+yt-dlp binary: yt-dlp
+GET /api/health -> 200 (102ms)
+POST /api/info -> 200 (9240ms)
+[download] completed for https://www.youtube.com/watch?v=dQw4w9WgXcQ format=93 hasStreamed=true
+GET /api/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&formatId=93 -> 200 (40261ms)
+GET /api/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&formatId=137 -> 400 (6988ms)
+[download] height 360 exact match -> format 93 proto=m3u8_native
+[download] completed for https://www.youtube.com/watch?v=dQw4w9WgXcQ format=93 hasStreamed=true
+GET /api/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&formatId=360 -> 200 (23407ms)
+[download] yt-dlp exited code 1: [youtube] Extracting URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+[youtube] dQw4w9WgXcQ: Downloading webpage
+[youtube] dQw4w9WgXcQ: Downloading android vr player API JSON
+[youtube] dQw4w9WgXcQ: Downloading player b7457b7c-main
+[youtube] [jsc:deno] Solving JS challenges using deno
+[youtube] dQw4w9WgXcQ: Downloading m3u8 information
+[info] dQw4w9WgXcQ: Downloading 1 format(s): 401+251
+[download] Destination: -
+[https @ 000001e6291efe00] HTTP error 403 Forbidden
+[in#0 @ 000001e62915a700] Error
+GET /api/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&formatId=401 -> 502 (14587ms)
+[download] height 2160 exact match -> format 401 proto=https
+[download] yt-dlp exited code 1: [youtube] Extracting URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+[youtube] dQw4w9WgXcQ: Downloading webpage
+[youtube] dQw4w9WgXcQ: Downloading android vr player API JSON
+[youtube] dQw4w9WgXcQ: Downloading player b7457b7c-main
+[youtube] [jsc:deno] Solving JS challenges using deno
+[youtube] dQw4w9WgXcQ: Downloading m3u8 information
+[info] dQw4w9WgXcQ: Downloading 1 format(s): 401+251
+[download] Destination: -
+[https @ 0000023ce4b90900] HTTP error 403 Forbidden
+[in#0 @ 0000023ce4afa480] Error
+GET /api/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&formatId=2160 -> 502 (12529ms)
+POST /api/info -> 200 (8238ms)
+POST /api/info -> 200 (10410ms)
+[unhandled] SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)
+    at JSON.parse (<anonymous>)
+    at parse (E:\VS Code Programming Files\GRWP\GrabAClip\node_modules\body-parser\lib\types\json.js:96:19)
+    at E:\VS Code Programming Files\GRWP\GrabAClip\node_modules\body-parser\lib\read.js:128:18
+    at AsyncResource.runInAsyncScope (node:async_hooks:227:14)
+    at invokeCallback (E:\VS Code Programming Files\GRWP\GrabAClip\node_modules\raw-body\index.js:238:16)
+    at done (E:\VS Code Programming Files\GRWP\GrabAClip\node_modules\raw-body\index.js:227:7)
+    at IncomingMessage.onEnd (E:\VS Code Programming Files\GRWP\GrabAClip\node_modules\raw-body\index.js:287:7)
+    at IncomingMessage.emit (node:events:509:28)
+    at endReadableNT (node:internal/streams/readable:1729:12)
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+  expose: true,
+  statusCode: 400,
+  status: 400,
+  body: '{url:https://www.youtube.com/watch?v=980cWx9wyd8}',
+  type: 'entity.parse.failed'
+}
+[download] info fetch failed for https://www.youtube.com/watch?v=980cWx9wyd8: ERROR: [youtube] 980cWx9wyd8: Sign in to confirm your age. This video may be inappropriate for some users. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+
+GET /api/download?url=https://www.youtube.com/watch?v=980cWx9wyd8&formatId=93 -> 403 (15257ms)
+GET /api/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&formatId=invalid99 -> 400 (13061ms)
+[download] height 144 exact match -> format 91 proto=m3u8_native
+[download] completed for https://www.youtube.com/watch?v=dQw4w9WgXcQ format=91 hasStreamed=true
+GET /api/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&formatId=144 -> 200 (37720ms)
+[download] height 240 exact match -> format 92 proto=m3u8_native
+[download] yt-dlp exited code null: [youtube] Extracting URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ
+[youtube] dQw4w9WgXcQ: Downloading webpage
+[youtube] dQw4w9WgXcQ: Downloading android vr player API JSON
+[youtube] dQw4w9WgXcQ: Downloading player b7457b7c-main
+[youtube] [jsc:deno] Solving JS challenges using deno
+[youtube] dQw4w9WgXcQ: Downloading m3u8 information
+[info] dQw4w9WgXcQ: Downloading 1 format(s): 92
+[hlsnative] Downloading m3u8 manifest
+[hlsnative] Total fragments: 39
+[download] Destination: -
+
+[download] completed for https://www.youtube.com/watch?v=dQw4w9WgXcQ format=93 hasStreamed=true
+GET /api/download?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&formatId=93 -> 200 (30873ms)

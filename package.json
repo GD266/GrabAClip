@@ -1,0 +1,19 @@
+{
+  "name": "grabaclip",
+  "version": "1.0.0",
+  "description": "Grab a Clip - Simple YouTube video downloader (Phase 1: Core Downloader)",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

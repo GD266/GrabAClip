@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Grab a Clip</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>Grab a Clip</h1>
+      <p class="subtitle">Paste a YouTube URL to download the video</p>
+    </header>
+
+    <section class="input-section">
+      <label for="urlInput" class="sr-only">YouTube URL</label>
+      <input
+        id="urlInput"
+        type="url"
+        placeholder="Paste YouTube URL (https://www.youtube.com/watch?v=... or https://youtu.be/...)"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <button id="getVideoBtn">Get Video</button>
+    </section>
+
+    <div id="status" class="status" aria-live="polite"></div>
+
+    <hr />
+
+    <section id="videoSection" class="video-section hidden">
+      <h2>Video Information</h2>
+
+      <div class="video-info">
+        <img id="thumb" class="thumbnail" alt="Video thumbnail" />
+        <div class="meta">
+          <p><strong>Title:</strong> <span id="vTitle"></span></p>
+          <p><strong>Channel:</strong> <span id="vChannel"></span></p>
+          <p><strong>Duration:</strong> <span id="vDuration"></span></p>
+          <p><strong>Video ID:</strong> <span id="vId"></span></p>
+        </div>
+      </div>
+
+      <div class="controls">
+        <label for="qualitySelect">Quality:</label>
+        <select id="qualitySelect"></select>
+        <button id="downloadBtn">Download</button>
+      </div>
+
+      <div id="downloadStatus" class="status" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <footer>
+    <small>Phase 1 — Core Downloader. Temporary UI.</small>
+  </footer>
+
+  <script src="app.js" type="module"></script>
+</body>
+</html>
