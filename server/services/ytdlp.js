@@ -327,4 +327,53 @@ export function createDownloadStream(rawUrl, options = {}) {
     // Prefer mp4 where possible
     formatSelector = `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
   } else {
-    // specific f
+    // specific format id - try to merge audio if needed
+    // sanitize already validated formatId
+    formatSelector = `${formatId}+bestaudio/${formatId}/best`;
+  }
+
+  const args = [
+    "--no-playlist",
+    "--remote-components",
+    "ejs:github",
+    "-f",
+    formatSelector,
+    "--merge-output-format",
+    "mp4",
+    "--no-warnings",
+    "--no-progress",
+    "--socket-timeout",
+    "20",
+    "--retries",
+    "2",
+    "-o",
+    "-", // stdout
+    url,
+  ];
+
+  // Use spawn without shell
+  const proc = spawn(YTDLP_BIN, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+
+  // Set timeout for whole download (will be killed externally if needed)
+  const timeout = setTimeout(() => {
+    proc.kill("SIGKILL");
+  }, DOWNLOAD_TIMEOUT_MS);
+
+  // Cleanup timeout on exit
+  proc.on("close", () => clearTimeout(timeout));
+  proc.on("error", () => clearTimeout(timeout));
+
+  return proc;
+}
+
+/**
+ * Helper to get sanitized title for filename (quick info fetch)
+ * Uses getVideoInfo internally but with lighter parsing
+ */
+export async function getTitleForFilename(rawUrl) {
+  const info = await getVideoInfo(rawUrl);
+  return info.title;
+}

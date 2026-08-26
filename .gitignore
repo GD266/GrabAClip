@@ -1,0 +1,9 @@
+node_modules
+.env
+*.mp4
+*.part
+*.vtt
+*.srt
+*.ytdl
+server.log
+.DS_Store

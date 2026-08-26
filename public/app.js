@@ -13,6 +13,23 @@ const qualitySelect = document.getElementById("qualitySelect");
 const downloadBtn = document.getElementById("downloadBtn");
 const downloadStatusEl = document.getElementById("downloadStatus");
 
+// Phase 2 elements
+const vUploadDateEl = document.getElementById("vUploadDate");
+const vViewsEl = document.getElementById("vViews");
+const vLikesEl = document.getElementById("vLikes");
+const vDescriptionEl = document.getElementById("vDescription");
+const intelligenceSection = document.getElementById("intelligenceSection");
+const getIntelligenceBtn = document.getElementById("getIntelligenceBtn");
+const intelligenceStatusEl = document.getElementById("intelligenceStatus");
+const intelligenceContentEl = document.getElementById("intelligenceContent");
+const transcriptStatusEl = document.getElementById("transcriptStatus");
+const transcriptTextEl = document.getElementById("transcriptText");
+const aiOverviewEl = document.getElementById("aiOverview");
+const aiTopicsEl = document.getElementById("aiTopics");
+const aiKeyPointsEl = document.getElementById("aiKeyPoints");
+const aiProviderEl = document.getElementById("aiProvider");
+const aiErrorEl = document.getElementById("aiError");
+
 let currentUrl = "";
 let currentFormats = [];
 
@@ -117,6 +134,10 @@ async function getVideo() {
     vChannelEl.textContent = data.channel || "Unknown";
     vDurationEl.textContent = data.durationFormatted || (data.duration ? `${Math.floor(data.duration / 60)}:${String(data.duration % 60).padStart(2, "0")}` : "Unknown");
     vIdEl.textContent = data.videoId || extractVideoId(url) || "Unknown";
+    if (vUploadDateEl) vUploadDateEl.textContent = data.uploadDateFormatted || data.uploadDate || "Unknown";
+    if (vViewsEl) vViewsEl.textContent = data.viewCount != null ? Number(data.viewCount).toLocaleString() : "Unknown";
+    if (vLikesEl) vLikesEl.textContent = data.likeCount != null ? Number(data.likeCount).toLocaleString() : "Unknown";
+    if (vDescriptionEl) vDescriptionEl.textContent = data.description || "No description";
 
     if (data.thumbnail) {
       thumbEl.src = data.thumbnail;
@@ -152,13 +173,95 @@ async function getVideo() {
     }
 
     videoSection.classList.remove("hidden");
+    if (intelligenceSection) intelligenceSection.classList.remove("hidden");
     setStatus(statusEl, "Video found. Choose quality and download.", "success");
+    // Reset intelligence UI for new video
+    if (intelligenceStatusEl) setStatus(intelligenceStatusEl, "", "");
+    if (intelligenceContentEl) intelligenceContentEl.classList.add("hidden");
+    if (transcriptTextEl) transcriptTextEl.textContent = "";
+    if (aiOverviewEl) aiOverviewEl.textContent = "";
+    if (aiTopicsEl) aiTopicsEl.innerHTML = "";
+    if (aiKeyPointsEl) aiKeyPointsEl.innerHTML = "";
+    if (aiProviderEl) aiProviderEl.textContent = "";
+    if (aiErrorEl) setStatus(aiErrorEl, "", "");
   } catch (err) {
     setStatus(statusEl, err.message || "An error occurred.", "error");
     videoSection.classList.add("hidden");
+    if (intelligenceSection) intelligenceSection.classList.add("hidden");
   } finally {
     getVideoBtn.disabled = false;
     getVideoBtn.textContent = "Get Video";
+  }
+}
+
+async function getIntelligence() {
+  const url = currentUrl || urlInput.value.trim();
+  if (!url) {
+    setStatus(intelligenceStatusEl, "Please paste a YouTube URL first and fetch video.", "error");
+    return;
+  }
+  if (!isYouTubeUrl(url)) {
+    setStatus(intelligenceStatusEl, "Invalid YouTube URL.", "error");
+    return;
+  }
+  setStatus(intelligenceStatusEl, "Generating intelligence (transcript + AI)...", "loading");
+  if (intelligenceContentEl) intelligenceContentEl.classList.add("hidden");
+  getIntelligenceBtn.disabled = true;
+  getIntelligenceBtn.textContent = "Loading...";
+  if (aiErrorEl) setStatus(aiErrorEl, "", "");
+  try {
+    const res = await fetch("/api/intelligence", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Intelligence failed");
+    // Update expanded info if available (in case user didn't click Get Video)
+    if (data.video) {
+      if (vUploadDateEl && data.video.uploadDateFormatted) vUploadDateEl.textContent = data.video.uploadDateFormatted;
+      if (vViewsEl && data.video.viewCount != null) vViewsEl.textContent = Number(data.video.viewCount).toLocaleString();
+      if (vLikesEl && data.video.likeCount != null) vLikesEl.textContent = Number(data.video.likeCount).toLocaleString();
+      if (vDescriptionEl && data.video.description) vDescriptionEl.textContent = data.video.description;
+    }
+    // Show content
+    intelligenceContentEl.classList.remove("hidden");
+    // Transcript
+    if (data.transcript?.available) {
+      setStatus(transcriptStatusEl, `Transcript available (${data.transcript.language || "en"}${data.transcript.isAuto ? ", auto" : ", manual"}) — ${data.transcript.text.length} chars`, "success");
+      transcriptTextEl.textContent = data.transcript.text.slice(0, 8000) + (data.transcript.text.length > 8000 ? "\n...[truncated]" : "");
+    } else {
+      setStatus(transcriptStatusEl, data.transcript?.error || "Transcript unavailable", "error");
+      transcriptTextEl.textContent = "";
+    }
+    // About / AI
+    if (data.intelligence?.aboutVideo) {
+      aiOverviewEl.textContent = data.intelligence.aboutVideo.overview || "—";
+      aiTopicsEl.innerHTML = "";
+      aiKeyPointsEl.innerHTML = "";
+      (data.intelligence.aboutVideo.mainTopics || []).forEach(t => {
+        const li = document.createElement("li"); li.textContent = t; aiTopicsEl.appendChild(li);
+      });
+      (data.intelligence.aboutVideo.keyPoints || []).forEach(k => {
+        const li = document.createElement("li"); li.textContent = k; aiKeyPointsEl.appendChild(li);
+      });
+      aiProviderEl.textContent = `Provider: ${data.intelligence.aboutVideo.provider}${data.intelligence.aboutVideo.isFallback ? " (fallback/mock)" : ""}`;
+      setStatus(intelligenceStatusEl, "Intelligence generated", "success");
+      if (data.intelligence.aiError) setStatus(aiErrorEl, data.intelligence.aiError, "error");
+    } else {
+      aiOverviewEl.textContent = "—";
+      aiTopicsEl.innerHTML = ""; aiKeyPointsEl.innerHTML = "";
+      aiProviderEl.textContent = "";
+      setStatus(intelligenceStatusEl, "Intelligence generated (no AI summary)", "success");
+      if (data.intelligence?.aiError) setStatus(aiErrorEl, data.intelligence.aiError, "error");
+      else if (aiErrorEl) setStatus(aiErrorEl, "AI summary unavailable", "error");
+    }
+  } catch (err) {
+    setStatus(intelligenceStatusEl, err.message || "Intelligence failed", "error");
+    if (intelligenceContentEl) intelligenceContentEl.classList.add("hidden");
+  } finally {
+    getIntelligenceBtn.disabled = false;
+    getIntelligenceBtn.textContent = "Get Intelligence";
   }
 }
 
@@ -264,6 +367,7 @@ urlInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") getVideo();
 });
 downloadBtn.addEventListener("click", downloadVideo);
+if (getIntelligenceBtn) getIntelligenceBtn.addEventListener("click", getIntelligence);
 
 // Auto-clear status on input
 urlInput.addEventListener("input", () => {

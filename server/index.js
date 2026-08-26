@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import path from "node:path";
@@ -5,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import infoRouter from "./routes/info.js";
 import downloadRouter from "./routes/download.js";
+import intelligenceRouter from "./routes/intelligence.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,6 +38,7 @@ app.get("/api/health", (req, res) => {
 // API routes
 app.use("/api/info", infoRouter);
 app.use("/api/download", downloadRouter);
+app.use("/api/intelligence", intelligenceRouter);
 
 // Serve frontend
 app.use(express.static(path.join(ROOT, "public")));

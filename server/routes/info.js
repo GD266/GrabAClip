@@ -33,4 +33,14 @@ router.post("/", async (req, res) => {
     });
   } catch (e) {
     const status = e.status || 500;
-    const message = e.message ||
+    const message = e.message || "Failed to retrieve video information.";
+
+    // Do not expose stack / internal details
+    // Log server side
+    console.error(`[info] error for ${validation.normalizedUrl}:`, e.original || e.message);
+
+    return res.status(status).json({ error: message });
+  }
+});
+
+export default router;
