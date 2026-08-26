@@ -294,154 +294,186 @@ async function getIntelligence() {
   }
 }
 
+let isDownloadingVideo = false;
+let isDownloadingAudio = false;
+let currentAbortController = null;
+
+function formatBytesProgress(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function downloadWithProgress(url, statusEl, onProgress) {
+  // Use fetch with ReadableStream for progress without buffering entire file in one go
+  const response = await fetch(url, { signal: currentAbortController?.signal });
+  const contentType = response.headers.get("content-type") || "";
+  if (!response.ok) {
+    if (contentType.includes("application/json")) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.error || `Download failed (${response.status})`);
+    }
+    const text = await response.text().catch(() => "");
+    try {
+      const j = JSON.parse(text);
+      throw new Error(j.error || `Download failed (${response.status})`);
+    } catch {
+      if (text) throw new Error(`Download failed (${response.status}). ${text.slice(0, 200)}`);
+      throw new Error(`Download failed (${response.status})`);
+    }
+  }
+  if (contentType.includes("application/json")) {
+    const maybeError = await response.json().catch(() => ({}));
+    if (maybeError.error) throw new Error(maybeError.error);
+    throw new Error("Unexpected response. Expected file.");
+  }
+
+  // Try to get filename
+  let filename = null;
+  const disposition = response.headers.get("content-disposition");
+  if (disposition) {
+    const match = disposition.match(/filename\*?=(?:UTF-8''?)?["']?([^"';\n]+)["']?/i);
+    if (match) {
+      try { filename = decodeURIComponent(match[1].replace(/"/g, "")); } catch { filename = match[1]; }
+    }
+  }
+
+  const contentLength = response.headers.get("content-length") || response.headers.get("x-expected-size");
+  const total = contentLength ? parseInt(contentLength, 10) : null;
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+  let lastProgressUpdate = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    const now = Date.now();
+    if (now - lastProgressUpdate > 200 || received === total) {
+      lastProgressUpdate = now;
+      if (onProgress) onProgress(received, total);
+    }
+  }
+  // Combine chunks into blob
+  const blob = new Blob(chunks, { type: contentType || "application/octet-stream" });
+  // Try to get filename from disposition if not already
+  if (!filename) {
+    const ct = contentType.includes("video") ? "video.mp4" : contentType.includes("audio") ? "audio.m4a" : "download";
+    filename = ct;
+  }
+  return { blob, filename, contentType, total, received };
+}
+
 async function downloadVideo() {
+  if (isDownloadingVideo) return;
   if (!currentUrl) {
     setStatus(downloadStatusEl, "No video selected.", "error");
     return;
   }
-
   const selectedFormatId = qualitySelect.value || null;
-
-  setStatus(downloadStatusEl, "Starting download... (this may take a moment)", "loading");
+  isDownloadingVideo = true;
+  currentAbortController = new AbortController();
+  // Prevent duplicate, disable controls
   downloadBtn.disabled = true;
-  downloadBtn.textContent = "Downloading...";
-
+  downloadBtn.textContent = "Preparing...";
+  qualitySelect.disabled = true;
+  if (downloadAudioBtn) downloadAudioBtn.disabled = true;
+  if (audioQualitySelect) audioQualitySelect.disabled = true;
+  setStatus(downloadStatusEl, "Preparing...", "loading");
   try {
+    await new Promise(r => setTimeout(r, 200));
+    setStatus(downloadStatusEl, "Fetching video...", "loading");
     const params = new URLSearchParams({ url: currentUrl });
     if (selectedFormatId) params.set("formatId", selectedFormatId);
-
-    const res = await fetch(`/api/download?${params.toString()}`, {
-      method: "GET",
-    });
-
-    // Check if error JSON returned (when yt-dlp fails before streaming)
-    const contentType = res.headers.get("content-type") || "";
-
-    if (!res.ok) {
-      // Try to parse error JSON
-      if (contentType.includes("application/json")) {
-        const errData = await res.json();
-        throw new Error(errData.error || `Download failed (${res.status})`);
+    const downloadUrl = `/api/download?${params.toString()}`;
+    setStatus(downloadStatusEl, "Processing...", "loading");
+    const { blob, filename } = await downloadWithProgress(downloadUrl, downloadStatusEl, (received, total) => {
+      if (total) {
+        const pct = Math.round((received / total) * 100);
+        setStatus(downloadStatusEl, `Downloading... ${formatBytesProgress(received)} / ${formatBytesProgress(total)} (${pct}%)`, "loading");
       } else {
-        // Try to get text
-        const text = await res.text();
-        // If text is JSON-like parse attempt
-        try {
-          const j = JSON.parse(text);
-          throw new Error(j.error || `Download failed (${res.status})`);
-        } catch {
-          throw new Error(`Download failed (${res.status}). ${text.slice(0, 200)}`);
-        }
+        setStatus(downloadStatusEl, `Downloading... ${formatBytesProgress(received)}`, "loading");
       }
-    }
-
-    // If content-type is JSON but status ok, it means error was sent with 200? shouldn't happen, but handle
-    if (contentType.includes("application/json")) {
-      const maybeError = await res.json();
-      if (maybeError.error) throw new Error(maybeError.error);
-      throw new Error("Unexpected response. Expected video file.");
-    }
-
-    // Should be video/mp4
-    if (!contentType.includes("video") && !contentType.includes("octet-stream")) {
-      console.warn("Unexpected content-type:", contentType);
-    }
-
-    // Get filename from Content-Disposition if present
-    let filename = "video.mp4";
-    const disposition = res.headers.get("content-disposition");
-    if (disposition) {
-      const match = disposition.match(/filename\*?=(?:UTF-8''?)?["']?([^"';\n]+)["']?/i);
-      if (match) {
-        try {
-          filename = decodeURIComponent(match[1].replace(/"/g, ""));
-        } catch {
-          filename = match[1];
-        }
-      }
-    }
-
-    // Stream to blob (for large files, this loads into memory but keeps complexity low for Phase 1)
-    // For true streaming, we could use anchor with direct URL, but fetch gives better error handling.
-    // Alternative: window.location = download URL for direct browser handling, but less control.
-    const blob = await res.blob();
-
-    if (blob.size === 0) {
-      throw new Error("Downloaded file is empty. The requested quality may be unavailable.");
-    }
-
-    // Trigger download
+    });
+    if (blob.size === 0) throw new Error("Downloaded file is empty. The requested quality may be unavailable.");
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = filename;
+    a.download = filename || "video.mp4";
     document.body.appendChild(a);
     a.click();
     a.remove();
-    // Delay revoke to allow download start
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-
-    setStatus(downloadStatusEl, `Download started: ${filename} (${(blob.size / (1024*1024)).toFixed(1)} MB)`, "success");
+    setStatus(downloadStatusEl, `Complete: ${filename} (${(blob.size / (1024*1024)).toFixed(1)} MB)`, "success");
   } catch (err) {
-    setStatus(downloadStatusEl, err.message || "Download failed.", "error");
+    if (err.name === "AbortError") {
+      setStatus(downloadStatusEl, "Download cancelled.", "error");
+    } else {
+      setStatus(downloadStatusEl, err.message || "Download failed.", "error");
+    }
   } finally {
+    isDownloadingVideo = false;
+    currentAbortController = null;
     downloadBtn.disabled = false;
     downloadBtn.textContent = "Download";
+    qualitySelect.disabled = false;
+    if (downloadAudioBtn) downloadAudioBtn.disabled = false;
+    if (audioQualitySelect) audioQualitySelect.disabled = false;
   }
 }
 
 async function downloadAudio() {
+  if (isDownloadingAudio) return;
   if (!currentUrl) {
     setStatus(audioStatusEl, "No video selected. Fetch video first.", "error");
     return;
   }
   const selected = audioQualitySelect ? audioQualitySelect.value : "best";
   const format = selected || "best";
-  setStatus(audioStatusEl, `Starting audio download (${format})...`, "loading");
+  isDownloadingAudio = true;
+  currentAbortController = new AbortController();
   downloadAudioBtn.disabled = true;
-  downloadAudioBtn.textContent = "Downloading...";
+  downloadAudioBtn.textContent = "Preparing...";
+  if (audioQualitySelect) audioQualitySelect.disabled = true;
+  downloadBtn.disabled = true;
+  if (qualitySelect) qualitySelect.disabled = true;
+  setStatus(audioStatusEl, "Preparing...", "loading");
   try {
+    await new Promise(r => setTimeout(r, 150));
+    setStatus(audioStatusEl, "Fetching audio...", "loading");
     const params = new URLSearchParams({ url: currentUrl, format });
-    const res = await fetch(`/api/download/audio?${params.toString()}`, { method: "GET" });
-    const contentType = res.headers.get("content-type") || "";
-    if (!res.ok) {
-      if (contentType.includes("application/json")) {
-        const errData = await res.json();
-        throw new Error(errData.error || `Audio download failed (${res.status})`);
+    const downloadUrl = `/api/download/audio?${params.toString()}`;
+    setStatus(audioStatusEl, "Processing...", "loading");
+    const { blob, filename } = await downloadWithProgress(downloadUrl, audioStatusEl, (received, total) => {
+      if (total) {
+        const pct = Math.round((received / total) * 100);
+        setStatus(audioStatusEl, `Downloading... ${formatBytesProgress(received)} / ${formatBytesProgress(total)} (${pct}%)`, "loading");
       } else {
-        const text = await res.text();
-        try { const j = JSON.parse(text); throw new Error(j.error || `Audio download failed (${res.status})`); } catch { throw new Error(`Audio download failed (${res.status}). ${text.slice(0,200)}`); }
+        setStatus(audioStatusEl, `Downloading... ${formatBytesProgress(received)}`, "loading");
       }
-    }
-    if (contentType.includes("application/json")) {
-      const maybeError = await res.json();
-      if (maybeError.error) throw new Error(maybeError.error);
-      throw new Error("Unexpected response. Expected audio file.");
-    }
-    let filename = `audio.${format === "mp3" ? "mp3" : format === "m4a" ? "m4a" : "m4a"}`;
-    const disposition = res.headers.get("content-disposition");
-    if (disposition) {
-      const match = disposition.match(/filename\*?=(?:UTF-8''?)?["']?([^"';\n]+)["']?/i);
-      if (match) {
-        try { filename = decodeURIComponent(match[1].replace(/"/g, "")); } catch { filename = match[1]; }
-      }
-    }
-    const blob = await res.blob();
+    });
     if (blob.size === 0) throw new Error("Downloaded audio is empty. Try another format.");
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = filename;
+    a.download = filename || `audio.${format === "mp3" ? "mp3" : "m4a"}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-    setStatus(audioStatusEl, `Audio download started: ${filename} (${(blob.size/(1024*1024)).toFixed(1)} MB)`, "success");
+    setStatus(audioStatusEl, `Complete: ${filename} (${(blob.size/(1024*1024)).toFixed(1)} MB)`, "success");
   } catch (err) {
-    setStatus(audioStatusEl, err.message || "Audio download failed.", "error");
+    if (err.name === "AbortError") setStatus(audioStatusEl, "Audio download cancelled.", "error");
+    else setStatus(audioStatusEl, err.message || "Audio download failed.", "error");
   } finally {
+    isDownloadingAudio = false;
+    currentAbortController = null;
     downloadAudioBtn.disabled = false;
     downloadAudioBtn.textContent = "Download Audio";
+    if (audioQualitySelect) audioQualitySelect.disabled = false;
+    downloadBtn.disabled = false;
+    if (qualitySelect) qualitySelect.disabled = false;
   }
 }
 

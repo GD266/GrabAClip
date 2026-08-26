@@ -55,8 +55,9 @@ function classifyYtDlpError(stderr, code) {
 /**
  * Execute yt-dlp and capture stdout as JSON/ string, with timeout.
  * Uses spawn with array args to avoid shell injection.
+ * Supports AbortSignal for cancellation.
  */
-function execYtDlp(args, timeoutMs) {
+function execYtDlp(args, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
     const proc = spawn(YTDLP_BIN, args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -66,10 +67,25 @@ function execYtDlp(args, timeoutMs) {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
+
+    const onAbort = () => {
+      aborted = true;
+      try { proc.kill("SIGKILL"); } catch {}
+      const err = new Error("Request cancelled");
+      err.code = "ABORTED";
+      err.status = 499;
+      reject(err);
+    };
+
+    if (signal) {
+      if (signal.aborted) return onAbort();
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
 
     const timeout = setTimeout(() => {
       timedOut = true;
-      proc.kill("SIGKILL");
+      try { proc.kill("SIGKILL"); } catch {}
       const err = new Error("yt-dlp timed out");
       err.code = "TIMEOUT";
       err.stderr = stderr;
@@ -82,7 +98,7 @@ function execYtDlp(args, timeoutMs) {
       stdout += chunk.toString("utf-8");
       if (stdout.length > MAX_BUFFER) {
         clearTimeout(timeout);
-        proc.kill("SIGKILL");
+        try { proc.kill("SIGKILL"); } catch {}
         reject(new Error("yt-dlp output too large"));
       }
     });
@@ -93,7 +109,7 @@ function execYtDlp(args, timeoutMs) {
 
     proc.on("error", (err) => {
       clearTimeout(timeout);
-      // yt-dlp binary not found
+      if (signal) signal.removeEventListener("abort", onAbort);
       if (err.code === "ENOENT") {
         err.message = "yt-dlp binary not found. Please ensure yt-dlp is installed and in PATH.";
         err.status = 500;
@@ -103,7 +119,8 @@ function execYtDlp(args, timeoutMs) {
 
     proc.on("close", (code) => {
       clearTimeout(timeout);
-      if (timedOut) return;
+      if (signal) signal.removeEventListener("abort", onAbort);
+      if (timedOut || aborted) return;
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
@@ -141,41 +158,67 @@ function buildFormats(rawFormats) {
     (f) => f.vcodec && f.vcodec !== "none" && f.format_id && f.ext && !f.format_note?.includes("storyboard")
   );
 
-  // Group by height, keep best per height (prefer mp4 + has audio, then higher fps/bitrate)
-  // For reliability, prefer m3u8 (HLS) over https DASH for now due to YouTube SABR 403 issues on DASH
+  // Phase 4: Present sensible options rather than raw IDs
+  // - 360p, 480p, 720p, 1080p always (if available)
+  // - Higher resolutions only when reliably available (HLS/m3u8, not SABR-prone DASH)
+  const STANDARD_HEIGHTS = new Set([360, 480, 720, 1080]);
   const byHeight = new Map();
 
   for (const f of videoFormats) {
     const height = f.height || 0;
-    if (!height) continue; // skip audio-only or unknown
+    if (!height) continue;
+    // Only consider standard heights + higher if reliable
+    const proto = (f.protocol || f.proto || "").toLowerCase();
+    const isHls = proto.includes("m3u8");
+    // For standard heights, allow any protocol (HLS preferred via scoring)
+    // For higher >1080, only keep if HLS (reliably available)
+    if (height > 1080 && !isHls) {
+      continue;
+    }
+    // Also skip very low preview heights (<144) and storyboard
+    if (height < 144) continue;
 
-    const key = height; // deduplicate by exact height
-
+    const key = height;
     const existing = byHeight.get(key);
-    // Scoring: prefer m3u8 (HLS) for reliability, then mp4, has audio, higher fps, higher tbr
     const score = (fmt) => {
       let s = 0;
-      const proto = (fmt.protocol || fmt.proto || "").toLowerCase();
-      if (proto.includes("m3u8")) s += 5000; // strongly prefer HLS (reliable)
+      const p = (fmt.protocol || fmt.proto || "").toLowerCase();
+      if (p.includes("m3u8")) s += 5000; // HLS reliable
       if (fmt.ext === "mp4") s += 1000;
       if (fmt.acodec && fmt.acodec !== "none") s += 500;
       if (fmt.fps) s += fmt.fps;
       if (fmt.tbr) s += fmt.tbr / 100;
-      // Also prefer formats where protocol is http(s) but not dash video-only that requires ffmpeg merging?
-      // HLS pre-merged already good.
       return s;
     };
-
     if (!existing || score(f) > score(existing)) {
       byHeight.set(key, f);
     }
   }
 
-  // Convert to sorted array descending by height
-  const deduped = Array.from(byHeight.values()).sort((a, b) => b.height - a.height);
+  // Only keep sensible heights, sorted desc, limit to available
+  const allowedHeights = [1080, 720, 480, 360, 240, 144];
+  // If higher HLS existed (e.g., 1440 HLS), include it, but filter above ensures only reliable
+  // Build list: include 360/480/720/1080 if present, plus any higher HLS that passed filter
+  let deduped = Array.from(byHeight.values()).sort((a, b) => b.height - a.height);
+  // Filter to only show sensible options that are actually available
+  // Keep up to 4-5 options max, preferring standard heights
+  const standard = deduped.filter((f) => STANDARD_HEIGHTS.has(f.height));
+  const higher = deduped.filter((f) => f.height > 1080);
+  const lower = deduped.filter((f) => f.height < 360 && !STANDARD_HEIGHTS.has(f.height));
+  // Combine: higher (if any reliable) + standard + lower fallback if needed
+  let sensible = [...higher, ...standard];
+  // If no standard found (edge), fallback to lower
+  if (sensible.length === 0) sensible = deduped.slice(0, 4);
+  // Ensure we have at least 360 if available, but not duplicates
+  // Already handled
 
-  // Map to simplified format objects
-  return deduped.map((f) => ({
+  // If sensible still empty, use deduped
+  if (sensible.length === 0) sensible = deduped;
+
+  // Sort again desc
+  sensible.sort((a, b) => b.height - a.height);
+
+  return sensible.map((f) => ({
     formatId: f.format_id,
     ext: f.ext,
     height: f.height,
@@ -188,24 +231,19 @@ function buildFormats(rawFormats) {
     filesize: f.filesize || f.filesize_approx || null,
     tbr: f.tbr || null,
     formatNote: f.format_note || null,
-    // human label like "1080p" or "720p60"
     label: f.height ? `${f.height}p${f.fps && f.fps > 30 ? Math.round(f.fps) : ""}` : f.format_id,
-    // display label includes ext and audio indicator
-    displayLabel: `${f.height}p${f.fps && f.fps > 30 ? Math.round(f.fps) : ""} - ${f.ext} ${f.acodec && f.acodec !== "none" ? "" : "(video only, audio will be merged)"}`.trim(),
+    displayLabel: `${f.height}p`,
   }));
 }
 
 export function buildAudioFormats(rawFormats) {
   if (!Array.isArray(rawFormats)) return [];
 
-  // Filter audio-only: vcodec none, acodec present
   const audioOnly = rawFormats.filter(
     (f) => (!f.vcodec || f.vcodec === "none") && f.acodec && f.acodec !== "none" && f.format_id && f.ext
   );
-
   if (audioOnly.length === 0) return [];
 
-  // Helper to find best by abr/tbr
   const bestOverall = [...audioOnly].sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
   const bestM4a = [...audioOnly]
     .filter((f) => f.ext === "m4a")
@@ -214,10 +252,12 @@ export function buildAudioFormats(rawFormats) {
     .filter((f) => f.ext === "webm" || f.acodec?.toLowerCase().includes("opus"))
     .sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
 
+  // Phase 4: Small user-friendly selection — Best, High quality, MP3
   const normalized = [];
 
-  // Best (native, keep original ext)
+  // Best — highest quality native
   if (bestOverall) {
+    const isHigh = bestOverall.ext === "m4a" && Math.round(bestOverall.abr || 0) >= 120;
     normalized.push({
       id: "best",
       formatId: bestOverall.format_id,
@@ -226,60 +266,84 @@ export function buildAudioFormats(rawFormats) {
       abr: bestOverall.abr || bestOverall.tbr || null,
       filesize: bestOverall.filesize || bestOverall.filesize_approx || null,
       label: "Best",
-      displayLabel: `Best - ${bestOverall.ext} (${Math.round(bestOverall.abr || bestOverall.tbr || 0)}k)`,
+      displayLabel: `Best — ${bestOverall.ext.toUpperCase()} ${Math.round(bestOverall.abr || bestOverall.tbr || 0)}k`,
       isConversion: false,
     });
   }
 
-  // M4A native where available
+  // High quality — best M4A/AAC where available, distinct from Best
   if (bestM4a && bestM4a.format_id !== bestOverall?.format_id) {
     normalized.push({
-      id: "m4a",
+      id: "high",
       formatId: bestM4a.format_id,
       ext: "m4a",
       acodec: bestM4a.acodec,
       abr: bestM4a.abr || bestM4a.tbr || null,
       filesize: bestM4a.filesize || bestM4a.filesize_approx || null,
-      label: "M4A",
-      displayLabel: `M4A - AAC (${Math.round(bestM4a.abr || bestM4a.tbr || 0)}k)`,
+      label: "High",
+      displayLabel: `High — M4A ${Math.round(bestM4a.abr || bestM4a.tbr || 0)}k`,
       isConversion: false,
     });
   } else if (bestM4a && normalized.length === 0) {
-    // fallback: if bestOverall is m4a, still expose m4a as explicit
     normalized.push({
-      id: "m4a",
+      id: "high",
       formatId: bestM4a.format_id,
       ext: "m4a",
       acodec: bestM4a.acodec,
       abr: bestM4a.abr || bestM4a.tbr || null,
       filesize: bestM4a.filesize || bestM4a.filesize_approx || null,
-      label: "M4A",
-      displayLabel: `M4A - AAC (${Math.round(bestM4a.abr || bestM4a.tbr || 0)}k)`,
+      label: "High",
+      displayLabel: `High — M4A ${Math.round(bestM4a.abr || bestM4a.tbr || 0)}k`,
       isConversion: false,
     });
-  } else if (!bestM4a && bestOverall) {
-    // No native m4a, but we can offer m4a via conversion? But spec says M4A where available, so skip if not available
+  } else if (!bestM4a && bestOpus) {
+    // Fallback high quality if no M4A: best opus/webm
+    if (bestOpus.format_id !== bestOverall?.format_id) {
+      normalized.push({
+        id: "high",
+        formatId: bestOpus.format_id,
+        ext: bestOpus.ext,
+        acodec: bestOpus.acodec,
+        abr: bestOpus.abr || bestOpus.tbr || null,
+        filesize: bestOpus.filesize || bestOpus.filesize_approx || null,
+        label: "High",
+        displayLabel: `High — ${bestOpus.ext.toUpperCase()} ${Math.round(bestOpus.abr || bestOpus.tbr || 0)}k`,
+        isConversion: false,
+      });
+    }
   }
 
-  // MP3 via ffmpeg conversion (always available as conversion from best)
+  // MP3 where supported — always via conversion, small selection
   normalized.push({
     id: "mp3",
-    formatId: "mp3", // special, will be handled as conversion
+    formatId: "mp3",
     ext: "mp3",
     acodec: "mp3",
     abr: 192,
     filesize: null,
     label: "MP3",
-    displayLabel: "MP3 - Converted (192k)",
+    displayLabel: "MP3 — Converted 192k",
     isConversion: true,
   });
 
-  // Deduplicate by ext if best is already mp3? best is never mp3 natively (yt provides m4a/webm), so mp3 remains distinct.
-
-  return normalized;
+  // Ensure uniqueness by id, limit to 3
+  const seen = new Set();
+  const deduped = normalized.filter((a) => {
+    if (seen.has(a.id)) return false;
+    seen.add(a.id);
+    return true;
+  });
+  return deduped.slice(0, 3);
 }
 
-export async function getVideoInfo(rawUrl) {
+export async function getVideoInfo(rawUrl, options = {}) {
+  const { signal } = options;
+  if (signal?.aborted) {
+    const err = new Error("Request cancelled");
+    err.code = "ABORTED";
+    err.status = 499;
+    throw err;
+  }
   if (!isYouTubeUrl(rawUrl)) {
     const err = new Error("Invalid YouTube URL");
     err.status = 400;
@@ -304,8 +368,9 @@ export async function getVideoInfo(rawUrl) {
 
   let result;
   try {
-    result = await execYtDlp(args, INFO_TIMEOUT_MS);
+    result = await execYtDlp(args, INFO_TIMEOUT_MS, signal);
   } catch (e) {
+    if (e.code === "ABORTED" || e.status === 499) throw e;
     if (e.status) throw e;
     const classified = classifyYtDlpError(e.stderr || e.message, e.code);
     const err = new Error(classified.message);
@@ -502,7 +567,7 @@ export function createAudioDownloadStream(rawUrl, options = {}) {
       "-f", "mp3",
       "pipe:1",
     ];
-  } else if (normalizedFormat === "m4a" || normalizedFormat === "aac") {
+  } else if (normalizedFormat === "m4a" || normalizedFormat === "aac" || normalizedFormat === "high") {
     // Use HLS video -> extract aac to m4a (fragmented mp4, no re-encode where possible)
     ytdlpFormat = hlsFallback;
     outputExt = "m4a";

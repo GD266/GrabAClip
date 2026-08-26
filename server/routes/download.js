@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { execSync } from "node:child_process";
 import { validateDownloadQuery, sanitizeFilename, sanitizeAsciiFilename } from "../utils/validation.js";
 import { createDownloadStream, getVideoInfo } from "../services/ytdlp.js";
 
@@ -21,8 +22,21 @@ router.get("/", async (req, res) => {
   let title = "video";
   let effectiveFormatId = formatId;
   let effectiveIsHeight = isHeight;
+  let info = null;
+  const abortController = new AbortController();
+  let clientAborted = false;
+  const onClientAbort = () => {
+    clientAborted = true;
+    try { abortController.abort(); } catch {}
+  };
+  req.on("close", onClientAbort);
+  req.on("aborted", onClientAbort);
   try {
-    const info = await getVideoInfo(normalizedUrl);
+    info = await getVideoInfo(normalizedUrl, { signal: abortController.signal });
+    if (clientAborted) {
+      console.log("[download] client aborted during info fetch, aborting");
+      return;
+    }
     title = info.title;
 
     // If formatId provided as specific id, verify it exists (if requested format is height, skip check)
@@ -63,10 +77,22 @@ router.get("/", async (req, res) => {
       }
     }
   } catch (e) {
+    if (e.code === "ABORTED" || e.status === 499 || clientAborted) {
+      console.log("[download] aborted during info fetch");
+      return;
+    }
     const status = e.status || 500;
     const message = e.message || "Failed to retrieve video information.";
     console.error(`[download] info fetch failed for ${normalizedUrl}:`, e.original || e.message);
     return res.status(status).json({ error: message });
+  } finally {
+    // Remove info-phase abort listener, keep download-phase one
+    try { req.off("close", onClientAbort); req.off("aborted", onClientAbort); } catch {}
+  }
+
+  if (clientAborted || req.destroyed || res.writableEnded) {
+    console.log("[download] client already disconnected before download, aborting");
+    return;
   }
 
   const safeName = sanitizeFilename(title);
@@ -74,6 +100,12 @@ router.get("/", async (req, res) => {
   const encoded = encodeURIComponent(filename);
   // ASCII fallback for the quoted filename part (Node validates header as Latin1)
   const asciiFallback = sanitizeAsciiFilename(safeName);
+  // For progress: try to get filesize for selected format
+  let expectedSize = null;
+  try {
+    const bestMatch = info.formats.find((f) => f.formatId === effectiveFormatId);
+    if (bestMatch && bestMatch.filesize) expectedSize = bestMatch.filesize;
+  } catch {}
 
   let headersSent = false;
   function sendDownloadHeaders() {
@@ -82,15 +114,19 @@ router.get("/", async (req, res) => {
     res.status(200);
     res.setHeader("Content-Type", "video/mp4");
     // Use RFC5987 for UTF-8 filename* and ASCII fallback for filename
-    // Both are needed for compatibility; filename is strictly ASCII
     try {
       res.setHeader("Content-Disposition", `attachment; filename="${asciiFallback}.mp4"; filename*=UTF-8''${encoded}`);
     } catch (e) {
-      // Fallback to ASCII-only if header still invalid
       console.error("[download] header set failed, using fallback", e.message);
       res.setHeader("Content-Disposition", `attachment; filename="video.mp4"`);
     }
     res.setHeader("X-Content-Type-Options", "nosniff");
+    if (expectedSize) {
+      res.setHeader("Content-Length", String(expectedSize));
+      res.setHeader("X-Expected-Size", String(expectedSize));
+    }
+    // For progress: expose headers to frontend
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Disposition, X-Expected-Size");
   }
 
   let downloadProc;
@@ -115,42 +151,85 @@ router.get("/", async (req, res) => {
     if (stderr.length > 8192) stderr = stderr.slice(-8192);
   });
 
-  // If client aborts, kill process and cleanup
+  // Backend reliability: ensure yt-dlp (and its ffmpeg child) cannot remain after disconnect
+  let cleaned = false;
+  const killProcTree = (proc) => {
+    if (!proc || proc.killed) return;
+    try {
+      if (process.platform === "win32") {
+        try { execSync(`taskkill /PID ${proc.pid} /T /F`, { stdio: "ignore" }); } catch {}
+      } else {
+        try { process.kill(-proc.pid, "SIGKILL"); } catch {}
+      }
+    } catch {}
+    try { proc.kill("SIGKILL"); } catch {}
+  };
   const onClose = () => {
-    if (downloadProc && !downloadProc.killed) {
-      downloadProc.kill("SIGKILL");
-    }
+    if (cleaned) return;
+    cleaned = true;
+    try {
+      if (downloadProc && !downloadProc.killed) {
+        killProcTree(downloadProc);
+        console.log("[download] killed yt-dlp due to client disconnect");
+      }
+    } catch {}
+    cleanup();
+  };
+  const onReqAborted = () => {
+    console.log("[download] req aborted");
+    onClose();
   };
   req.on("close", onClose);
+  req.on("aborted", onReqAborted);
+  req.on("error", onClose);
   res.on("close", onClose);
-
-  // Timeout handling is inside createDownloadStream (5min)
+  res.on("error", onClose);
+  res.on("finish", () => {
+    cleaned = true;
+    cleanup();
+  });
 
   let stdoutEnded = false;
+  let lastByteTime = Date.now();
 
   downloadProc.stdout.on("data", (chunk) => {
+    lastByteTime = Date.now();
     if (!headersSent) sendDownloadHeaders();
     hasStartedStreaming = true;
-    // Backpressure handled by pipe? We write manually to respect streaming without loading all in memory
-    const ok = res.write(chunk);
-    if (!ok) {
-      downloadProc.stdout.pause();
-      res.once("drain", () => downloadProc.stdout.resume());
+    // Backpressure + broken pipe handling
+    try {
+      const ok = res.write(chunk);
+      if (!ok) {
+        downloadProc.stdout.pause();
+        res.once("drain", () => {
+          try { downloadProc.stdout.resume(); } catch {}
+        });
+      }
+    } catch (e) {
+      console.error("[download] res.write failed (broken pipe)", e.message);
+      onClose();
     }
+  });
+
+  downloadProc.stdout.on("error", (err) => {
+    console.error("[download] stdout error", err.message);
+    if (!headersSent && !res.headersSent && !res.writableEnded) {
+      res.status(502).json({ error: "Download streaming error." });
+    }
+  });
+
+  downloadProc.stderr.on("error", (err) => {
+    console.error("[download] stderr error", err.message);
   });
 
   downloadProc.stdout.on("end", () => {
     stdoutEnded = true;
     // Do not end response here - wait for 'close' event to determine success/failure
-    // If process already closed with success, we will end in close handler
-    // But if close not yet fired, we keep connection open briefly
-    // For immediate success where close hasn't fired yet, set a short fallback
     setTimeout(() => {
       if (stdoutEnded && !res.writableEnded && !headersSent) {
         // No data and process hasn't closed yet? will be handled by close
       } else if (stdoutEnded && hasStartedStreaming && !res.writableEnded) {
-        // If we have streamed and stdout ended but close hasn't fired within 1s, end gracefully
-        // Wait for close to handle error codes; this is fallback
+        // fallback
       }
     }, 1000);
   });

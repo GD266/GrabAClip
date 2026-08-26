@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { execSync } from "node:child_process";
 import { sanitizeFilename, sanitizeAsciiFilename, isYouTubeUrl, normalizeYouTubeUrl } from "../utils/validation.js";
 import { createAudioDownloadStream, getVideoInfo } from "../services/ytdlp.js";
 
@@ -17,45 +18,74 @@ router.get("/", async (req, res) => {
   }
   const normalizedUrl = normalizeYouTubeUrl(url);
   const format = String(formatParam || "best").toLowerCase().trim();
-  const allowed = new Set(["best", "mp3", "m4a", "aac", "opus", "wav"]);
+  // Normalize aliases: high -> m4a, aac -> m4a
+  const normalizedFormatForCheck = format === "high" ? "m4a" : format;
+  const allowed = new Set(["best", "mp3", "m4a", "aac", "high", "opus", "wav"]);
   if (!allowed.has(format)) {
     return res.status(400).json({ error: `Unsupported audio format "${formatParam}". Supported: mp3, m4a, best` });
   }
 
-  // Get video info for title and to check availability
+  // Get video info for title and to check availability (abortable)
   let title = "audio";
   let info = null;
+  const abortController = new AbortController();
+  let clientAborted = false;
+  const onClientAbortInfo = () => {
+    clientAborted = true;
+    try { abortController.abort(); } catch {}
+  };
+  req.on("close", onClientAbortInfo);
+  req.on("aborted", onClientAbortInfo);
   try {
-    info = await getVideoInfo(normalizedUrl);
+    info = await getVideoInfo(normalizedUrl, { signal: abortController.signal });
+    if (clientAborted) {
+      console.log("[audio] client aborted during info fetch");
+      return;
+    }
     title = info.title;
   } catch (e) {
+    if (e.code === "ABORTED" || e.status === 499 || clientAborted) {
+      console.log("[audio] aborted during info fetch");
+      return;
+    }
     const status = e.status || 500;
     const message = e.message || "Failed to retrieve video information.";
     console.error(`[audio] info fetch failed for ${normalizedUrl}:`, e.original || e.message);
     return res.status(status).json({ error: message });
+  } finally {
+    try { req.off("close", onClientAbortInfo); req.off("aborted", onClientAbortInfo); } catch {}
+  }
+  if (clientAborted || req.destroyed || res.writableEnded) {
+    console.log("[audio] client disconnected before audio download");
+    return;
   }
 
   const safeName = sanitizeFilename(title);
   const asciiFallback = sanitizeAsciiFilename(safeName);
 
-  // Determine output ext and content-type
+  // Determine output ext and content-type, and expected size for progress
   let outputExt = format;
+  let expectedSize = null;
   if (format === "best") {
-    // Use best audio ext from info if available
     const bestAudio = info.audioFormats?.find((a) => a.id === "best") || info.audioFormats?.[0];
     if (bestAudio) {
       outputExt = bestAudio.ext;
-      // Normalize webm/opus to webm, m4a stays m4a
       if (outputExt === "webm") outputExt = "webm";
       else if (outputExt === "m4a") outputExt = "m4a";
       else outputExt = bestAudio.ext;
+      if (bestAudio.filesize) expectedSize = bestAudio.filesize;
     } else {
       outputExt = "m4a";
     }
-  } else if (format === "aac") {
+  } else if (format === "aac" || format === "high") {
     outputExt = "m4a";
+    const highAudio = info.audioFormats?.find((a) => a.id === "high") || info.audioFormats?.find((a) => a.id === "m4a");
+    if (highAudio && highAudio.filesize) expectedSize = highAudio.filesize;
   } else if (format === "opus") {
     outputExt = "webm";
+  } else if (format === "m4a") {
+    const m4aAudio = info.audioFormats?.find((a) => a.ext === "m4a");
+    if (m4aAudio && m4aAudio.filesize) expectedSize = m4aAudio.filesize;
   }
 
   const filename = `${safeName}.${outputExt}`;
@@ -66,7 +96,6 @@ router.get("/", async (req, res) => {
     if (headersSent) return;
     headersSent = true;
     res.status(200);
-    // Content-Type based on ext
     const mimeMap = {
       mp3: "audio/mpeg",
       m4a: "audio/mp4",
@@ -85,6 +114,14 @@ router.get("/", async (req, res) => {
       res.setHeader("Content-Disposition", `attachment; filename="audio.${outputExt}"`);
     }
     res.setHeader("X-Content-Type-Options", "nosniff");
+    // Only send Content-Length when not transcoding (size known and not mp3 conversion)
+    if (expectedSize && format !== "mp3") {
+      res.setHeader("Content-Length", String(expectedSize));
+      res.setHeader("X-Expected-Size", String(expectedSize));
+    } else if (expectedSize) {
+      res.setHeader("X-Expected-Size", String(expectedSize));
+    }
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Disposition, X-Expected-Size");
   }
 
   let ytdlpProc, ffmpegProc, stream, isConversion;
@@ -119,25 +156,47 @@ router.get("/", async (req, res) => {
     });
   }
 
-  const onClose = () => {
-    try { if (ytdlpProc && !ytdlpProc.killed) ytdlpProc.kill("SIGKILL"); } catch {}
-    try { if (ffmpegProc && !ffmpegProc.killed) ffmpegProc.kill("SIGKILL"); } catch {}
+  let cleaned = false;
+  const killTree = (proc) => {
+    if (!proc || proc.killed) return;
+    try {
+      if (process.platform === "win32") {
+        try { execSync(`taskkill /PID ${proc.pid} /T /F`, { stdio: "ignore" }); } catch {}
+      } else {
+        try { process.kill(-proc.pid, "SIGKILL"); } catch {}
+      }
+    } catch {}
+    try { proc.kill("SIGKILL"); } catch {}
   };
+  const onClose = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try { if (ytdlpProc) killTree(ytdlpProc); } catch {}
+    try { if (ffmpegProc) killTree(ffmpegProc); } catch {}
+    if (!res.writableEnded) console.log("[audio] killed procs on client disconnect");
+    cleanup();
+  };
+  const onAborted = () => { console.log("[audio] req aborted"); onClose(); };
   req.on("close", onClose);
+  req.on("aborted", onAborted);
+  req.on("error", onClose);
   res.on("close", onClose);
+  res.on("error", onClose);
+  res.on("finish", () => { cleaned = true; cleanup(); });
 
   stream.on("data", (chunk) => {
     if (!headersSent) sendAudioHeaders();
     hasStartedStreaming = true;
-    const ok = res.write(chunk);
-    if (!ok) {
-      stream.pause();
-      res.once("drain", () => stream.resume());
+    try {
+      const ok = res.write(chunk);
+      if (!ok) {
+        stream.pause();
+        res.once("drain", () => { try { stream.resume(); } catch {} });
+      }
+    } catch (e) {
+      console.error("[audio] res.write failed (broken pipe)", e.message);
+      onClose();
     }
-  });
-
-  stream.on("end", () => {
-    // Wait for close events to determine success
   });
 
   stream.on("error", (err) => {
@@ -149,6 +208,16 @@ router.get("/", async (req, res) => {
       if (!res.writableEnded) res.end();
     }
   });
+  // Also handle ytdlp stdout errors (broken pipe when ffmpeg exits early)
+  if (ytdlpProc.stdout) {
+    ytdlpProc.stdout.on("error", (err) => console.error("[audio] ytdlp stdout error", err.message));
+  }
+  if (ffmpegProc && ffmpegProc.stdin) {
+    ffmpegProc.stdin.on("error", (err) => console.error("[audio] ffmpeg stdin error", err.message));
+  }
+  if (ffmpegProc && ffmpegProc.stdout) {
+    ffmpegProc.stdout.on("error", (err) => console.error("[audio] ffmpeg stdout error", err.message));
+  }
 
   let ytdlpCode = null;
   let ffmpegCode = null;
