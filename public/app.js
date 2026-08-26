@@ -38,6 +38,9 @@ const audioStatusEl = document.getElementById("audioStatus");
 
 const cancelVideoBtn = document.getElementById("cancelVideoBtn");
 const cancelAudioBtn = document.getElementById("cancelAudioBtn");
+const vIdKickerEl = document.getElementById("vIdKicker");
+const thumbFallbackEl = document.getElementById("thumbFallback");
+const inputShellEl = document.getElementById("inputShell");
 
 let currentUrl = "";
 let currentFormats = [];
@@ -94,8 +97,11 @@ function isYouTubeUrl(s) {
 }
 
 function setStatus(el, message, type = "") {
+  if (!el) return;
   el.textContent = message;
-  el.className = "status" + (type ? ` ${type}` : "");
+  const base = "status";
+  const extra = el.id === "status" ? " hero-status" : (el.id === "downloadStatus" || el.id === "audioStatus" || el.id === "intelligenceStatus") ? " card-status" : "";
+  el.className = base + extra + (type ? ` ${type}` : "");
 }
 
 function formatBytes(bytes) {
@@ -136,7 +142,12 @@ async function getVideo() {
   setStatus(statusEl, "Fetching video information...", "loading");
   setStatus(downloadStatusEl, "", "");
   getVideoBtn.disabled = true;
-  getVideoBtn.textContent = "Loading...";
+  const _label = getVideoBtn.querySelector(".btn-label");
+  const _spinner = getVideoBtn.querySelector(".btn-spinner");
+  if (_label) _label.textContent = "Loading...";
+  else getVideoBtn.textContent = "Loading...";
+  if (_spinner) _spinner.classList.remove("hidden");
+  if (inputShellEl) inputShellEl.style.opacity = "0.85";
   videoSection.classList.add("hidden");
 
   try {
@@ -160,6 +171,7 @@ async function getVideo() {
     vChannelEl.textContent = data.channel || "Unknown";
     vDurationEl.textContent = data.durationFormatted || (data.duration ? `${Math.floor(data.duration / 60)}:${String(data.duration % 60).padStart(2, "0")}` : "Unknown");
     vIdEl.textContent = data.videoId || extractVideoId(url) || "Unknown";
+    if (vIdKickerEl) vIdKickerEl.textContent = data.videoId ? `ID ${data.videoId}` : "Ready to download";
     if (vUploadDateEl) vUploadDateEl.textContent = data.uploadDateFormatted || data.uploadDate || "Unknown";
     if (vViewsEl) vViewsEl.textContent = data.viewCount != null ? Number(data.viewCount).toLocaleString() : "Unknown";
     if (vLikesEl) vLikesEl.textContent = data.likeCount != null ? Number(data.likeCount).toLocaleString() : "Unknown";
@@ -168,9 +180,16 @@ async function getVideo() {
     if (data.thumbnail) {
       thumbEl.src = data.thumbnail;
       thumbEl.style.display = "block";
+      if (thumbFallbackEl) thumbFallbackEl.classList.add("hidden");
+      thumbEl.onload = () => { if (thumbFallbackEl) thumbFallbackEl.classList.add("hidden"); };
+      thumbEl.onerror = () => {
+        thumbEl.style.display = "none";
+        if (thumbFallbackEl) thumbFallbackEl.classList.remove("hidden");
+      };
     } else {
       thumbEl.removeAttribute("src");
       thumbEl.style.display = "none";
+      if (thumbFallbackEl) thumbFallbackEl.classList.remove("hidden");
     }
 
     // Populate quality selector
@@ -233,7 +252,12 @@ async function getVideo() {
     if (intelligenceSection) intelligenceSection.classList.add("hidden");
   } finally {
     getVideoBtn.disabled = false;
-    getVideoBtn.textContent = "Get Video";
+    const _lbl2 = getVideoBtn.querySelector(".btn-label");
+    const _sp2 = getVideoBtn.querySelector(".btn-spinner");
+    if (_lbl2) _lbl2.textContent = "Get video";
+    else getVideoBtn.textContent = "Get video";
+    if (_sp2) _sp2.classList.add("hidden");
+    if (inputShellEl) inputShellEl.style.opacity = "";
   }
 }
 
