@@ -30,7 +30,7 @@
       <section class="hero">
         <div class="hero-copy">
           <h1 class="hero-title">Paste a YouTube link and grab it.</h1>
-          <p class="hero-sub">Fetch video, audio, transcript and AI intelligence — instant, local, no account.</p>
+          <p class="hero-sub">Download video with audio or extract audio in your choice of quality — local, instant, no account.</p>
         </div>
 
         <div class="hero-field">
@@ -52,140 +52,164 @@
               <span class="btn-spinner hidden" aria-hidden="true"></span>
             </button>
           </div>
-          <div id="status" class="status hero-status" aria-live="polite"></div>
+          <div id="status" class="status hero-status" data-base-class="status hero-status" aria-live="polite"></div>
         </div>
       </section>
 
-      <!-- Video result -->
-      <section id="videoSection" class="card card-video hidden">
-        <div class="card-head">
-          <h2 class="card-title">Video</h2>
-          <span class="card-kicker" id="vIdKicker">Ready to download</span>
-        </div>
-
-        <div class="video-layout">
-          <div class="thumb-wrap">
-            <img id="thumb" class="thumbnail" alt="Video thumbnail" />
-            <div id="thumbFallback" class="thumb-fallback hidden" aria-hidden="true">
-              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="3" width="18" height="14" rx="2"/><path d="M8 13 11.5 9.5 16 14"/><circle cx="10.5" cy="7.5" r="1.5"/></svg>
-            </div>
-          </div>
-
-          <div class="meta">
-            <h3 id="vTitle" class="meta-title"></h3>
-            <div class="meta-row">
-              <span id="vChannel" class="meta-channel"></span>
-              <span class="meta-dot" aria-hidden="true">·</span>
-              <span id="vDuration" class="meta-duration"></span>
-            </div>
-
-            <dl class="meta-grid">
-              <div class="meta-item">
-                <dt>Video ID</dt>
-                <dd id="vId" class="mono"></dd>
+      <div id="resultArea" class="result hidden">
+        <!-- Video summary -->
+        <section class="card card-meta">
+          <div class="video-layout">
+            <div class="thumb-wrap">
+              <img id="thumb" class="thumbnail" alt="Video thumbnail" />
+              <div id="thumbFallback" class="thumb-fallback hidden" aria-hidden="true">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="3" width="18" height="14" rx="2"/><path d="M8 13 11.5 9.5 16 14"/><circle cx="10.5" cy="7.5" r="1.5"/></svg>
               </div>
-              <div class="meta-item">
-                <dt>Upload date</dt>
-                <dd id="vUploadDate"></dd>
-              </div>
-              <div class="meta-item">
-                <dt>Views</dt>
-                <dd id="vViews"></dd>
-              </div>
-              <div class="meta-item">
-                <dt>Likes</dt>
-                <dd id="vLikes"></dd>
-              </div>
-            </dl>
-
-            <details class="desc-details">
-              <summary>Description</summary>
-              <div id="vDescription" class="desc-body"></div>
-            </details>
-          </div>
-        </div>
-
-        <div class="controls-row">
-          <div class="control-group">
-            <label for="qualitySelect" class="control-label">Quality</label>
-            <div class="select-wrap">
-              <select id="qualitySelect"></select>
             </div>
-          </div>
-          <div class="control-actions">
-            <button id="downloadBtn" class="btn btn-primary">Download</button>
-            <button id="cancelVideoBtn" class="btn btn-ghost cancel-btn hidden">Cancel</button>
-          </div>
-        </div>
-        <div id="downloadStatus" class="status card-status" aria-live="polite"></div>
-      </section>
 
-      <!-- Audio -->
-      <section id="audioSection" class="card hidden">
-        <div class="card-head">
-          <h2 class="card-title">Audio</h2>
-          <span class="card-kicker">Extract audio without video</span>
-        </div>
-        <div class="controls-row">
-          <div class="control-group">
-            <label for="audioQualitySelect" class="control-label">Format</label>
-            <div class="select-wrap">
-              <select id="audioQualitySelect"></select>
-            </div>
-          </div>
-          <div class="control-actions">
-            <button id="downloadAudioBtn" class="btn btn-secondary">Download audio</button>
-            <button id="cancelAudioBtn" class="btn btn-ghost cancel-btn hidden">Cancel</button>
-          </div>
-        </div>
-        <div id="audioStatus" class="status card-status" aria-live="polite"></div>
-      </section>
-
-      <!-- Intelligence -->
-      <section id="intelligenceSection" class="card hidden">
-        <div class="card-head">
-          <div>
-            <h2 class="card-title">Intelligence</h2>
-            <p class="card-desc">AI overview, topics and transcript — restrained, on demand.</p>
-          </div>
-          <button id="getIntelligenceBtn" class="btn btn-secondary btn-sm">Get intelligence</button>
-        </div>
-        <div id="intelligenceStatus" class="status card-status" aria-live="polite"></div>
-
-        <div id="intelligenceContent" class="intelligence-body hidden">
-          <div class="intel-block">
-            <div class="intel-head">
-              <h3 class="intel-title">Transcript</h3>
-              <span id="transcriptStatus" class="intel-kicker"></span>
-            </div>
-            <pre id="transcriptText" class="transcript"></pre>
-          </div>
-
-          <div class="intel-block">
-            <div class="intel-head">
-              <h3 class="intel-title">About this video</h3>
-              <span id="aiProvider" class="intel-kicker"></span>
-            </div>
-            <div id="aboutVideo" class="about-card">
-              <div class="about-row">
-                <span class="about-label">Overview</span>
-                <p id="aiOverview" class="about-text"></p>
+            <div class="meta">
+              <h2 id="vTitle" class="meta-title"></h2>
+              <div class="meta-row">
+                <span id="vChannel" class="meta-channel"></span>
+                <span class="meta-dot" aria-hidden="true">·</span>
+                <span id="vDuration" class="meta-duration"></span>
+                <span class="meta-dot" aria-hidden="true">·</span>
+                <span id="vIdKicker" class="meta-id mono"></span>
               </div>
-              <div class="about-grid">
-                <div class="about-col">
-                  <span class="about-label">Main topics</span>
-                  <ul id="aiTopics" class="about-list"></ul>
+
+              <dl class="meta-grid">
+                <div class="meta-item">
+                  <dt>Upload date</dt>
+                  <dd id="vUploadDate"></dd>
                 </div>
-                <div class="about-col">
-                  <span class="about-label">Key points</span>
-                  <ul id="aiKeyPoints" class="about-list"></ul>
+                <div class="meta-item">
+                  <dt>Views</dt>
+                  <dd id="vViews"></dd>
                 </div>
+                <div class="meta-item">
+                  <dt>Likes</dt>
+                  <dd id="vLikes"></dd>
+                </div>
+                <div class="meta-item">
+                  <dt>Qualities</dt>
+                  <dd id="vQualityCount"></dd>
+                </div>
+              </dl>
+
+              <details class="desc-details">
+                <summary>Description</summary>
+                <div id="vDescription" class="desc-body"></div>
+              </details>
+            </div>
+          </div>
+        </section>
+
+        <!-- Download tabs -->
+        <section class="card card-downloads">
+          <div class="tabbar" role="tablist" aria-label="Download options">
+            <button id="tabVideo" class="tab is-active" role="tab" aria-selected="true" aria-controls="panelVideo">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="3"/><path d="M10 9.5 15 12l-5 2.5v-5Z"/></svg>
+              Video
+            </button>
+            <button id="tabAudio" class="tab" role="tab" aria-selected="false" aria-controls="panelAudio">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+              Audio
+            </button>
+            <button id="tabIntel" class="tab" role="tab" aria-selected="false" aria-controls="panelIntel">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v2M12 19v2M5 12H3M21 12h-2M6.3 6.3 4.9 4.9M19.1 19.1l-1.4-1.4M17.7 6.3l1.4-1.4M4.9 19.1l1.4-1.4"/><circle cx="12" cy="12" r="4"/></svg>
+              Intelligence
+            </button>
+          </div>
+
+          <!-- Video panel -->
+          <section id="panelVideo" class="panel" role="tabpanel" aria-labelledby="tabVideo">
+            <div class="panel-head">
+              <div>
+                <h3 class="panel-title">Download video</h3>
+                <p class="panel-desc">MP4 with audio included — full quality, complete file.</p>
+              </div>
+              <span class="panel-badge" id="videoBadge">MP4</span>
+            </div>
+
+            <div id="qualityGrid" class="option-grid" role="radiogroup" aria-label="Video quality"></div>
+            <p id="videoSourceNote" class="option-note"></p>
+
+            <div class="panel-actions">
+              <button id="downloadBtn" class="btn btn-primary">Download video</button>
+              <button id="cancelVideoBtn" class="btn btn-ghost cancel-btn hidden">Cancel</button>
+            </div>
+            <div id="videoProgress" class="progress hidden" aria-hidden="true"><div class="progress-fill"></div></div>
+            <div id="downloadStatus" class="status card-status" data-base-class="status card-status" aria-live="polite"></div>
+          </section>
+
+          <!-- Audio panel -->
+          <section id="panelAudio" class="panel hidden" role="tabpanel" aria-labelledby="tabAudio">
+            <div class="panel-head">
+              <div>
+                <h3 class="panel-title">Download audio</h3>
+                <p class="panel-desc">Audio only — original stream or converted to MP3 / WAV.</p>
+              </div>
+              <span class="panel-badge" id="audioBadge">Audio</span>
+            </div>
+
+            <div id="audioOptions" class="option-grid option-grid-audio" role="radiogroup" aria-label="Audio format"></div>
+            <p id="audioSourceNote" class="option-note"></p>
+
+            <div class="panel-actions">
+              <button id="downloadAudioBtn" class="btn btn-primary">Download audio</button>
+              <button id="cancelAudioBtn" class="btn btn-ghost cancel-btn hidden">Cancel</button>
+            </div>
+            <div id="audioProgress" class="progress hidden" aria-hidden="true"><div class="progress-fill"></div></div>
+            <div id="audioStatus" class="status card-status" data-base-class="status card-status" aria-live="polite"></div>
+          </section>
+
+          <!-- Intelligence panel -->
+          <section id="panelIntel" class="panel hidden" role="tabpanel" aria-labelledby="tabIntel">
+            <div class="panel-head">
+              <div>
+                <h3 class="panel-title">Intelligence</h3>
+                <p class="panel-desc">Transcript and AI overview, generated on demand.</p>
+              </div>
+              <button id="getIntelligenceBtn" class="btn btn-secondary btn-sm">Get intelligence</button>
+            </div>
+            <div id="intelligenceStatus" class="status card-status" data-base-class="status card-status" aria-live="polite"></div>
+
+            <div id="intelligenceContent" class="intelligence-body hidden">
+              <div class="intel-block">
+                <div class="intel-head">
+                  <h3 class="intel-title">Transcript</h3>
+                  <span id="transcriptStatus" class="intel-kicker" data-base-class="intel-kicker"></span>
+                </div>
+                <pre id="transcriptText" class="transcript"></pre>
+              </div>
+
+              <div class="intel-block">
+                <div class="intel-head">
+                  <h3 class="intel-title">About this video</h3>
+                  <span id="aiProvider" class="intel-kicker"></span>
+                </div>
+                <div id="aboutVideo" class="about-card">
+                  <div class="about-row">
+                    <span class="about-label">Overview</span>
+                    <p id="aiOverview" class="about-text"></p>
+                  </div>
+                  <div class="about-grid">
+                    <div class="about-col">
+                      <span class="about-label">Main topics</span>
+                      <ul id="aiTopics" class="about-list"></ul>
+                    </div>
+                    <div class="about-col">
+                      <span class="about-label">Key points</span>
+                      <ul id="aiKeyPoints" class="about-list"></ul>
+                    </div>
+                  </div>
+                </div>
+                <div id="aiError" class="status" data-base-class="status"></div>
               </div>
             </div>
-            <div id="aiError" class="status"></div>
-          </div>
-        </div>
-      </section>
+          </section>
+        </section>
+      </div>
     </main>
 
     <footer class="site-footer">

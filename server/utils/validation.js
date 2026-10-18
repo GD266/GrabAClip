@@ -80,6 +80,9 @@ export function validateInfoRequest(body) {
   return { valid: true, videoId: extractVideoId(body.url), normalizedUrl: normalizeYouTubeUrl(body.url) };
 }
 
+const SELECTABLE_HEIGHTS = new Set([144, 240, 360, 480, 720, 1080]);
+const HEIGHT_PATTERN = /^(144|240|360|480|720|1080)p?$/i;
+
 export function validateDownloadQuery(query) {
   const url = query.url;
   if (!url || typeof url !== "string" || !url.trim()) {
@@ -92,41 +95,40 @@ export function validateDownloadQuery(query) {
     };
   }
 
-  // formatId is optional, but if provided must be valid
-  // quality alternative: if neither provided, use best
-  const formatId = query.formatId || query.format_id || query.quality || null;
-
-  // If formatId looks like a height (144,240,360,480,720,1080,1440,2160) allow it
-  // Only whitelist known heights to avoid colliding with numeric formatIds like 137
-  if (formatId) {
-    const str = String(formatId).trim();
-    if (/^(144|240|360|480|720|1080|1440|2160)p?$/.test(str)) {
-      // normalize: 720p -> 720
-      return {
-        valid: true,
-        videoId: extractVideoId(url),
-        normalizedUrl: normalizeYouTubeUrl(url),
-        formatId: str.replace("p", ""),
-        isHeight: true,
-      };
+  // Preferred selection: `height` (144p … 1080p), matching the quality list
+  // built by buildVideoFormats().
+  let height = null;
+  const heightParam = query.height ?? query.quality;
+  if (heightParam !== undefined && heightParam !== null && String(heightParam).trim() !== "") {
+    const str = String(heightParam).trim();
+    if (!HEIGHT_PATTERN.test(str)) {
+      return { valid: false, error: "Invalid quality selection." };
     }
-    if (!isValidFormatId(str)) {
+    height = parseInt(str, 10);
+    if (!SELECTABLE_HEIGHTS.has(height)) {
+      return { valid: false, error: "Invalid quality selection." };
+    }
+  }
+
+  // Legacy: `formatId` with a raw yt-dlp format id, or a height like "720p".
+  let formatId = null;
+  const formatIdParam = query.formatId || query.format_id;
+  if (!height && formatIdParam !== undefined && formatIdParam !== null && String(formatIdParam).trim() !== "") {
+    const str = String(formatIdParam).trim();
+    if (HEIGHT_PATTERN.test(str)) {
+      height = parseInt(str, 10);
+    } else if (isValidFormatId(str)) {
+      formatId = str;
+    } else {
       return { valid: false, error: "Invalid format selection." };
     }
-    return {
-      valid: true,
-      videoId: extractVideoId(url),
-      normalizedUrl: normalizeYouTubeUrl(url),
-      formatId: str,
-      isHeight: false,
-    };
   }
 
   return {
     valid: true,
     videoId: extractVideoId(url),
     normalizedUrl: normalizeYouTubeUrl(url),
-    formatId: null,
-    isHeight: false,
+    height,
+    formatId,
   };
 }

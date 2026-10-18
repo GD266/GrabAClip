@@ -18,6 +18,10 @@ export function startDownload(type, url) {
     startedAt: Date.now(),
     lastUpdate: Date.now(),
     error: null,
+    // 0-100 progress of the media fetch from YouTube (YouTube -> server).
+    progress: 0,
+    // Human readable detail for the current phase (shown in the UI).
+    detail: null,
   };
   active.set(key, entry);
   return entry;
@@ -30,6 +34,22 @@ export function setPhase(type, url, phase, extra = {}) {
   entry.phase = phase;
   entry.lastUpdate = Date.now();
   if (extra.error !== undefined) entry.error = extra.error;
+  return entry;
+}
+
+/**
+ * Update progress (0-100) and/or detail text for an active download.
+ * Called while yt-dlp pulls media from YouTube.
+ */
+export function setProgressDetail(type, url, progress, detail) {
+  const key = `${type}:${url}`;
+  const entry = active.get(key);
+  if (!entry) return null;
+  if (typeof progress === "number" && Number.isFinite(progress)) {
+    entry.progress = Math.max(0, Math.min(100, Math.round(progress)));
+  }
+  if (detail !== undefined && detail !== null) entry.detail = detail;
+  entry.lastUpdate = Date.now();
   return entry;
 }
 

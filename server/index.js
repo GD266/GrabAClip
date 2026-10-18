@@ -51,6 +51,9 @@ app.use("/api/intelligence", intelligenceRouter);
 // Serve frontend
 app.use(express.static(path.join(ROOT, "public")));
 
+// Shared code (canonical YouTube URL validation) is imported by the frontend.
+app.use("/shared", express.static(path.join(ROOT, "shared")));
+
 // Fallback to index.html for SPA-like behavior (or just serve file for unknown routes that accept html)
 app.get("*", (req, res) => {
   // If API not matched, serve index

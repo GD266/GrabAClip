@@ -1,11 +1,66 @@
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { isYouTubeUrl, normalizeYouTubeUrl } from "../utils/validation.js";
 
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 const INFO_TIMEOUT_MS = 30000; // 30s
-const DOWNLOAD_TIMEOUT_MS = 300000; // 5min
+const DOWNLOAD_TIMEOUT_MS = 1200000; // 20min (1080p HLS can be large + slow links)
 
-function classifyYtDlpError(stderr, code) {
+// Temp workspace for media jobs. yt-dlp needs a real file so it can run its
+// HLS (TS -> MP4) fixup, merge video+audio into MP4, and postprocess audio.
+const TEMP_ROOT = path.join(os.tmpdir(), "grabaclip");
+
+export const MIME_BY_EXT = {
+  mp4: "video/mp4",
+  mkv: "video/x-matroska",
+  webm: "video/webm",
+  mov: "video/quicktime",
+  m4a: "audio/mp4",
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  opus: "audio/opus",
+  ogg: "audio/ogg",
+  aac: "audio/aac",
+};
+
+// Shared yt-dlp flags for info/report style calls (no media transferred).
+const YTDLP_QUIET_FLAGS = ["--no-playlist", "--remote-components", "ejs:github", "--no-warnings", "--no-progress"];
+
+// Flags for media jobs: progress lines are parsed to feed the UI status.
+// Note: the "download:" prefix of --progress-template is the template TYPE,
+// so the printed line is "<format>" only (e.g. "GACDL  12.3%").
+const YTDLP_JOB_FLAGS = [
+  "--no-playlist",
+  "--remote-components",
+  "ejs:github",
+  "--no-warnings",
+  "--newline",
+  "--progress-template",
+  "download:GACDL %(progress._percent_str)s",
+];
+
+// Video heights the UI offers, best first.
+export const VIDEO_HEIGHTS = [1080, 720, 480, 360, 240, 144];
+
+// HLS video variants are used as the audio source (music/mp3/wav extraction).
+// 93/94/95/96 carry AAC-LC 128k audio; 91/92 are HE-AAC 48k fallbacks.
+const AUDIO_SOURCE_LADDER = "93/94/95/96/92/91/bestaudio[ext=m4a]/bestaudio/best";
+
+// Audio formats always offered by the UI. mp3/wav are converted with ffmpeg.
+export const AUDIO_OPTIONS = [
+  { id: "m4a", quality: null, ext: "m4a", label: "M4A", displayLabel: "M4A — native AAC", note: "Original stream, no re-encode", isConversion: false },
+  { id: "mp3", quality: 320, ext: "mp3", label: "MP3 320", displayLabel: "MP3 — 320 kbps", note: "Highest MP3 quality", isConversion: true },
+  { id: "mp3", quality: 192, ext: "mp3", label: "MP3 192", displayLabel: "MP3 — 192 kbps", note: "Balanced quality and size", isConversion: true },
+  { id: "mp3", quality: 128, ext: "mp3", label: "MP3 128", displayLabel: "MP3 — 128 kbps", note: "Smaller file", isConversion: true },
+  { id: "wav", quality: null, ext: "wav", label: "WAV", displayLabel: "WAV — lossless PCM", note: "Uncompressed, very large file", isConversion: true },
+];
+
+export const AUDIO_FORMAT_IDS = new Set(["m4a", "mp3", "wav", "best", "aac", "high", "opus"]);
+export const AUDIO_MP3_QUALITIES = new Set([320, 192, 128]);
+
+export function classifyYtDlpError(stderr, code) {
   const lower = (stderr || "").toLowerCase();
 
   if (lower.includes("video unavailable") || lower.includes("this video is unavailable")) {
@@ -15,7 +70,6 @@ function classifyYtDlpError(stderr, code) {
     return { status: 403, message: "This video is private and cannot be downloaded." };
   }
   // Age-restricted / authentication required — must be checked before generic 403
-  // Covers yt-dlp messages: "Sign in to confirm your age", "age-restricted", "inappropriate for some users", etc.
   if (
     lower.includes("confirm your age") ||
     lower.includes("age-restricted") ||
@@ -36,11 +90,26 @@ function classifyYtDlpError(stderr, code) {
   if (lower.includes("live event") || lower.includes("live chat") || lower.includes("premiere will begin")) {
     return { status: 400, message: "Live streams and premieres are not supported." };
   }
+  if (
+    lower.includes("requested format is not available") ||
+    lower.includes("requested format not available") ||
+    lower.includes("format not available") ||
+    lower.includes("format not found") ||
+    lower.includes("no video formats found")
+  ) {
+    return { status: 400, message: "Requested quality is not available. Please choose another quality." };
+  }
   if (lower.includes("unsupported url")) {
     return { status: 400, message: "Unsupported URL. Please provide a valid YouTube video URL." };
   }
   if (lower.includes("unable to extract") || lower.includes("extraction failed")) {
     return { status: 502, message: "Failed to extract video information. YouTube may have changed its format or the video is restricted." };
+  }
+  // HTTP 403 on media data: YouTube periodically blocks the media URLs of this
+  // network/session. HLS variants usually keep working; retrying after a short
+  // wait (or choosing another quality) is the reliable remedy.
+  if (lower.includes("http error 403") || lower.includes("unable to download video data") || lower.includes("forbidden")) {
+    return { status: 502, message: "YouTube temporarily blocked this download (HTTP 403). Wait a moment and try again, or pick another quality." };
   }
   if (lower.includes("network") || lower.includes("timeout") || lower.includes("http error 429")) {
     return { status: 502, message: "Network error while contacting YouTube. Please try again." };
@@ -53,7 +122,7 @@ function classifyYtDlpError(stderr, code) {
 }
 
 /**
- * Execute yt-dlp and capture stdout as JSON/ string, with timeout.
+ * Execute yt-dlp and capture stdout as JSON/string, with timeout.
  * Uses spawn with array args to avoid shell injection.
  * Supports AbortSignal for cancellation.
  */
@@ -145,196 +214,204 @@ function formatDuration(seconds) {
 
 function pickThumbnail(thumbnails) {
   if (!Array.isArray(thumbnails) || thumbnails.length === 0) return null;
-  // Prefer highest resolution
   const sorted = [...thumbnails].sort((a, b) => (b.width || 0) - (a.width || 0) || (b.height || 0) - (a.height || 0));
   return sorted[0]?.url || null;
 }
 
-function buildFormats(rawFormats) {
+// ---------------------------------------------------------------------------
+// Format planning
+// ---------------------------------------------------------------------------
+
+function isHls(f) {
+  return String(f.protocol || f.proto || "").toLowerCase().includes("m3u8");
+}
+
+function exactSize(f) {
+  return f.filesize || f.filesize_approx || null;
+}
+
+/**
+ * Estimate a format's byte size: exact when yt-dlp reported it, otherwise
+ * duration * bitrate (kbps -> bytes).
+ */
+function estimateSize(f, duration) {
+  const exact = exactSize(f);
+  if (exact) return exact;
+  const tbr = f.tbr || f.abr || null;
+  if (tbr && duration) return Math.round(((tbr * 1000) / 8) * duration);
+  return null;
+}
+
+/**
+ * Codec preference for merged downloads: H.264 (avc1) plays everywhere,
+ * AV1 (av01) next, then VP9. Within a codec, higher bitrate wins.
+ */
+function codecRank(vcodec) {
+  const v = String(vcodec || "").toLowerCase();
+  if (v.startsWith("avc1")) return 0;
+  if (v.startsWith("av01")) return 1;
+  if (v.startsWith("vp09") || v.startsWith("vp9") || v.startsWith("vp8")) return 2;
+  return 3;
+}
+
+/**
+ * Build the per-height download plans exposed to the UI.
+ *
+ * Strategy (verified against this machine's YouTube behaviour):
+ *  - HLS (m3u8) streams download reliably, so a muxed HLS variant at the exact
+ *    height is preferred (video + audio in one stream, no merge).
+ *  - Otherwise merge a video-only DASH format with the best audio-only format.
+ *  - Progressive (plain https, muxed) formats are a last resort: they are the
+ *    ones most likely to return HTTP 403.
+ */
+export function buildVideoFormats(rawFormats, duration = null) {
   if (!Array.isArray(rawFormats)) return [];
 
-  // Filter to formats that have video codec != none, and exclude storyboard, mhtml
-  const videoFormats = rawFormats.filter(
-    (f) => f.vcodec && f.vcodec !== "none" && f.format_id && f.ext && !f.format_note?.includes("storyboard")
+  const usable = rawFormats.filter(
+    (f) =>
+      f.format_id &&
+      f.ext &&
+      f.ext !== "mhtml" &&
+      !String(f.format_note || "").toLowerCase().includes("storyboard")
   );
 
-  // Phase 4: Present sensible options rather than raw IDs
-  // - 360p, 480p, 720p, 1080p always (if available)
-  // - Higher resolutions only when reliably available (HLS/m3u8, not SABR-prone DASH)
-  const STANDARD_HEIGHTS = new Set([360, 480, 720, 1080]);
-  const byHeight = new Map();
+  const video = usable.filter((f) => f.vcodec && f.vcodec !== "none" && f.height);
+  const audioOnly = usable.filter((f) => (!f.vcodec || f.vcodec === "none") && f.acodec && f.acodec !== "none");
 
-  for (const f of videoFormats) {
-    const height = f.height || 0;
-    if (!height) continue;
-    // Only consider standard heights + higher if reliable
-    const proto = (f.protocol || f.proto || "").toLowerCase();
-    const isHls = proto.includes("m3u8");
-    // For standard heights, allow any protocol (HLS preferred via scoring)
-    // For higher >1080, only keep if HLS (reliably available)
-    if (height > 1080 && !isHls) {
-      continue;
+  const bestAudio =
+    [...audioOnly].sort((a, b) => {
+      const m4a = (x) => (x.ext === "m4a" ? 0 : 1);
+      return m4a(a) - m4a(b) || (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0);
+    })[0] || null;
+
+  const hlsMuxed = video.filter((f) => isHls(f) && f.acodec && f.acodec !== "none");
+  const hlsVideoOnly = video.filter((f) => isHls(f) && (!f.acodec || f.acodec === "none"));
+  const dashVideoOnly = video.filter((f) => !isHls(f) && (!f.acodec || f.acodec === "none"));
+  const progressive = video.filter((f) => !isHls(f) && f.acodec && f.acodec !== "none");
+
+  const availableHeights = [...new Set(
+    [...video].map((f) => f.height).filter((h) => h >= 144 && h <= 1080)
+  )].sort((a, b) => b - a);
+
+  const plans = [];
+  for (const height of availableHeights) {
+    let plan = null;
+
+    const muxed = hlsMuxed
+      .filter((f) => f.height === height)
+      .sort((a, b) => (b.tbr || b.abr || 0) - (a.tbr || a.abr || 0))[0];
+    if (muxed) {
+      plan = {
+        kind: "muxed",
+        formatIds: [muxed.format_id],
+        source: "hls",
+        vcodec: muxed.vcodec,
+        acodec: muxed.acodec,
+        fps: muxed.fps || null,
+        estimatedSize: estimateSize(muxed, duration),
+      };
     }
-    // Also skip very low preview heights (<144) and storyboard
-    if (height < 144) continue;
 
-    const key = height;
-    const existing = byHeight.get(key);
-    const score = (fmt) => {
-      let s = 0;
-      const p = (fmt.protocol || fmt.proto || "").toLowerCase();
-      if (p.includes("m3u8")) s += 5000; // HLS reliable
-      if (fmt.ext === "mp4") s += 1000;
-      if (fmt.acodec && fmt.acodec !== "none") s += 500;
-      if (fmt.fps) s += fmt.fps;
-      if (fmt.tbr) s += fmt.tbr / 100;
-      return s;
+    if (!plan) {
+      const videoOnly = [...dashVideoOnly, ...hlsVideoOnly]
+        .filter((f) => f.height === height)
+        .sort((a, b) => codecRank(a.vcodec) - codecRank(b.vcodec) || (b.tbr || 0) - (a.tbr || 0))[0];
+      if (videoOnly && bestAudio) {
+        const vSize = estimateSize(videoOnly, duration);
+        const aSize = estimateSize(bestAudio, duration);
+        plan = {
+          kind: "merge",
+          formatIds: [videoOnly.format_id, bestAudio.format_id],
+          source: isHls(videoOnly) ? "hls" : "dash",
+          vcodec: videoOnly.vcodec,
+          acodec: bestAudio.acodec || "aac",
+          fps: videoOnly.fps || null,
+          estimatedSize: vSize && aSize ? vSize + aSize : vSize || aSize || null,
+        };
+      }
+    }
+
+    if (!plan) {
+      const prog = progressive
+        .filter((f) => f.height === height)
+        .sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+      if (prog) {
+        plan = {
+          kind: "progressive",
+          formatIds: [prog.format_id],
+          source: "progressive",
+          vcodec: prog.vcodec,
+          acodec: prog.acodec || "aac",
+          fps: prog.fps || null,
+          estimatedSize: estimateSize(prog, duration),
+        };
+      }
+    }
+
+    if (!plan) continue;
+
+    plans.push({
+      height,
+      label: `${height}p`,
+      displayLabel: `${height}p`,
+      ext: "mp4",
+      hasAudio: true,
+      formatId: plan.formatIds.join("+"),
+      ...plan,
+    });
+  }
+
+  return plans;
+}
+
+/** Always-available audio options (see AUDIO_OPTIONS). */
+export function buildAudioFormats() {
+  return AUDIO_OPTIONS.map((o) => ({ ...o }));
+}
+
+/**
+ * Choose the yt-dlp format used as the audio source for extraction.
+ * Prefers the smallest HLS variant carrying AAC-LC audio, then any HLS
+ * variant, then DASH bestaudio.
+ */
+export function pickAudioSource(rawFormats) {
+  if (!Array.isArray(rawFormats)) return null;
+
+  const hlsAudio = rawFormats.filter(
+    (f) => isHls(f) && f.acodec && f.acodec !== "none" && f.height
+  );
+  if (hlsAudio.length > 0) {
+    const lc = hlsAudio.filter((f) => String(f.acodec).toLowerCase().startsWith("mp4a.40.2"));
+    const pool = lc.length > 0 ? lc : hlsAudio;
+    const chosen = [...pool].sort((a, b) => a.height - b.height || (a.tbr || 0) - (b.tbr || 0))[0];
+    return {
+      formatId: chosen.format_id,
+      height: chosen.height,
+      ext: "mp4",
+      acodec: chosen.acodec,
+      label: `HLS ${chosen.height}p (${lc.length > 0 ? "AAC 128k" : "HE-AAC"})`,
     };
-    if (!existing || score(f) > score(existing)) {
-      byHeight.set(key, f);
-    }
   }
 
-  // Only keep sensible heights, sorted desc, limit to available
-  const allowedHeights = [1080, 720, 480, 360, 240, 144];
-  // If higher HLS existed (e.g., 1440 HLS), include it, but filter above ensures only reliable
-  // Build list: include 360/480/720/1080 if present, plus any higher HLS that passed filter
-  let deduped = Array.from(byHeight.values()).sort((a, b) => b.height - a.height);
-  // Filter to only show sensible options that are actually available
-  // Keep up to 4-5 options max, preferring standard heights
-  const standard = deduped.filter((f) => STANDARD_HEIGHTS.has(f.height));
-  const higher = deduped.filter((f) => f.height > 1080);
-  const lower = deduped.filter((f) => f.height < 360 && !STANDARD_HEIGHTS.has(f.height));
-  // Combine: higher (if any reliable) + standard + lower fallback if needed
-  let sensible = [...higher, ...standard];
-  // If no standard found (edge), fallback to lower
-  if (sensible.length === 0) sensible = deduped.slice(0, 4);
-  // Ensure we have at least 360 if available, but not duplicates
-  // Already handled
+  const bestAudio = [...rawFormats]
+    .filter((f) => (!f.vcodec || f.vcodec === "none") && f.acodec && f.acodec !== "none")
+    .sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
+  if (bestAudio) {
+    return {
+      formatId: bestAudio.format_id,
+      height: null,
+      ext: bestAudio.ext,
+      acodec: bestAudio.acodec,
+      label: `DASH audio (${Math.round(bestAudio.abr || bestAudio.tbr || 0)}k)`,
+    };
+  }
 
-  // If sensible still empty, use deduped
-  if (sensible.length === 0) sensible = deduped;
-
-  // Sort again desc
-  sensible.sort((a, b) => b.height - a.height);
-
-  return sensible.map((f) => ({
-    formatId: f.format_id,
-    ext: f.ext,
-    height: f.height,
-    width: f.width || null,
-    fps: f.fps || null,
-    vcodec: f.vcodec,
-    acodec: f.acodec || "none",
-    protocol: f.protocol || f.proto || null,
-    hasAudio: !!(f.acodec && f.acodec !== "none"),
-    filesize: f.filesize || f.filesize_approx || null,
-    tbr: f.tbr || null,
-    formatNote: f.format_note || null,
-    label: f.height ? `${f.height}p${f.fps && f.fps > 30 ? Math.round(f.fps) : ""}` : f.format_id,
-    displayLabel: `${f.height}p`,
-  }));
+  return null;
 }
 
-export function buildAudioFormats(rawFormats) {
-  if (!Array.isArray(rawFormats)) return [];
-
-  const audioOnly = rawFormats.filter(
-    (f) => (!f.vcodec || f.vcodec === "none") && f.acodec && f.acodec !== "none" && f.format_id && f.ext
-  );
-  if (audioOnly.length === 0) return [];
-
-  const bestOverall = [...audioOnly].sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
-  const bestM4a = [...audioOnly]
-    .filter((f) => f.ext === "m4a")
-    .sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
-  const bestOpus = [...audioOnly]
-    .filter((f) => f.ext === "webm" || f.acodec?.toLowerCase().includes("opus"))
-    .sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
-
-  // Phase 4: Small user-friendly selection — Best, High quality, MP3
-  const normalized = [];
-
-  // Best — highest quality native
-  if (bestOverall) {
-    const isHigh = bestOverall.ext === "m4a" && Math.round(bestOverall.abr || 0) >= 120;
-    normalized.push({
-      id: "best",
-      formatId: bestOverall.format_id,
-      ext: bestOverall.ext,
-      acodec: bestOverall.acodec,
-      abr: bestOverall.abr || bestOverall.tbr || null,
-      filesize: bestOverall.filesize || bestOverall.filesize_approx || null,
-      label: "Best",
-      displayLabel: `Best — ${bestOverall.ext.toUpperCase()} ${Math.round(bestOverall.abr || bestOverall.tbr || 0)}k`,
-      isConversion: false,
-    });
-  }
-
-  // High quality — best M4A/AAC where available, distinct from Best
-  if (bestM4a && bestM4a.format_id !== bestOverall?.format_id) {
-    normalized.push({
-      id: "high",
-      formatId: bestM4a.format_id,
-      ext: "m4a",
-      acodec: bestM4a.acodec,
-      abr: bestM4a.abr || bestM4a.tbr || null,
-      filesize: bestM4a.filesize || bestM4a.filesize_approx || null,
-      label: "High",
-      displayLabel: `High — M4A ${Math.round(bestM4a.abr || bestM4a.tbr || 0)}k`,
-      isConversion: false,
-    });
-  } else if (bestM4a && normalized.length === 0) {
-    normalized.push({
-      id: "high",
-      formatId: bestM4a.format_id,
-      ext: "m4a",
-      acodec: bestM4a.acodec,
-      abr: bestM4a.abr || bestM4a.tbr || null,
-      filesize: bestM4a.filesize || bestM4a.filesize_approx || null,
-      label: "High",
-      displayLabel: `High — M4A ${Math.round(bestM4a.abr || bestM4a.tbr || 0)}k`,
-      isConversion: false,
-    });
-  } else if (!bestM4a && bestOpus) {
-    // Fallback high quality if no M4A: best opus/webm
-    if (bestOpus.format_id !== bestOverall?.format_id) {
-      normalized.push({
-        id: "high",
-        formatId: bestOpus.format_id,
-        ext: bestOpus.ext,
-        acodec: bestOpus.acodec,
-        abr: bestOpus.abr || bestOpus.tbr || null,
-        filesize: bestOpus.filesize || bestOpus.filesize_approx || null,
-        label: "High",
-        displayLabel: `High — ${bestOpus.ext.toUpperCase()} ${Math.round(bestOpus.abr || bestOpus.tbr || 0)}k`,
-        isConversion: false,
-      });
-    }
-  }
-
-  // MP3 where supported — always via conversion, small selection
-  normalized.push({
-    id: "mp3",
-    formatId: "mp3",
-    ext: "mp3",
-    acodec: "mp3",
-    abr: 192,
-    filesize: null,
-    label: "MP3",
-    displayLabel: "MP3 — Converted 192k",
-    isConversion: true,
-  });
-
-  // Ensure uniqueness by id, limit to 3
-  const seen = new Set();
-  const deduped = normalized.filter((a) => {
-    if (seen.has(a.id)) return false;
-    seen.add(a.id);
-    return true;
-  });
-  return deduped.slice(0, 3);
-}
+// ---------------------------------------------------------------------------
+// Info
+// ---------------------------------------------------------------------------
 
 export async function getVideoInfo(rawUrl, options = {}) {
   const { signal } = options;
@@ -353,12 +430,8 @@ export async function getVideoInfo(rawUrl, options = {}) {
   const url = normalizeYouTubeUrl(rawUrl);
 
   const args = [
-    "--no-playlist",
-    "--remote-components",
-    "ejs:github",
+    ...YTDLP_QUIET_FLAGS,
     "--dump-json",
-    "--no-warnings",
-    "--no-progress",
     "--socket-timeout",
     "15",
     "--retries",
@@ -388,14 +461,12 @@ export async function getVideoInfo(rawUrl, options = {}) {
     throw err;
   }
 
-  // Check if it's actually a video (not playlist)
   if (data._type === "playlist") {
     const err = new Error("Playlists are not supported. Please provide a single video URL.");
     err.status = 400;
     throw err;
   }
 
-  // Extract fields - required + optional (do not fail if optional missing)
   const videoId = data.id;
   const title = data.title || "Untitled";
   const channel = data.uploader || data.channel || data.uploader_id || "Unknown";
@@ -406,12 +477,12 @@ export async function getVideoInfo(rawUrl, options = {}) {
   const description = data.description || null;
   const viewCount = data.view_count ?? data.viewCount ?? null;
   const likeCount = data.like_count ?? data.likeCount ?? null;
-  // upload_date is YYYYMMDD from yt-dlp, convert to YYYY-MM-DD if valid
+
   let uploadDate = null;
   let uploadDateFormatted = null;
   if (data.upload_date && /^\d{8}$/.test(String(data.upload_date))) {
     const s = String(data.upload_date);
-    uploadDate = `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+    uploadDate = `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
     uploadDateFormatted = uploadDate;
   } else if (data.upload_date) {
     uploadDate = String(data.upload_date);
@@ -420,14 +491,9 @@ export async function getVideoInfo(rawUrl, options = {}) {
     uploadDate = String(data.release_date);
   }
 
-  // Build formats
-  const formats = buildFormats(data.formats);
-  const audioFormats = buildAudioFormats(data.formats);
-
-  if (formats.length === 0) {
-    // Fallback: at least offer some common qualities if raw formats empty but we have height?
-    // Could still fail
-  }
+  const formats = buildVideoFormats(data.formats, duration);
+  const audioFormats = buildAudioFormats();
+  const audioSource = pickAudioSource(data.formats);
 
   return {
     videoId,
@@ -435,7 +501,7 @@ export async function getVideoInfo(rawUrl, options = {}) {
     channel,
     uploader,
     channelId,
-    duration, // seconds
+    duration,
     durationFormatted: formatDuration(duration),
     thumbnail,
     description,
@@ -445,88 +511,133 @@ export async function getVideoInfo(rawUrl, options = {}) {
     uploadDateFormatted,
     formats,
     audioFormats,
-    // extra for debugging but not exposed? keep internal
-    _rawTitle: title,
+    audioSource,
+    // Internal: used by the audio route to pick the extraction source.
+    _audioSourceId: audioSource?.formatId || null,
     _rawData: {
-      // keep minimal raw for intelligence fallback
       tags: data.tags || null,
       categories: data.categories || null,
     },
   };
 }
 
-/**
- * Create a download stream process.
- * Returns child_process handle. Caller is responsible for piping and cleanup.
- * formatSelector: yt-dlp -f argument
- */
-export function createDownloadStream(rawUrl, options = {}) {
-  const { formatId = null, isHeight = false } = options;
+// ---------------------------------------------------------------------------
+// Media jobs (file based)
+// ---------------------------------------------------------------------------
 
-  if (!isYouTubeUrl(rawUrl)) {
-    const err = new Error("Invalid YouTube URL");
-    err.status = 400;
-    throw err;
-  }
-  const url = normalizeYouTubeUrl(rawUrl);
+function makeJobDir() {
+  fs.mkdirSync(TEMP_ROOT, { recursive: true });
+  return fs.mkdtempSync(path.join(TEMP_ROOT, "job-"));
+}
 
-  let formatSelector;
-  if (!formatId) {
-    formatSelector = "bestvideo+bestaudio/best";
-  } else if (isHeight) {
-    const h = String(formatId).replace("p", "");
-    // Prefer mp4 where possible
-    formatSelector = `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`;
-  } else {
-    // specific format id - try to merge audio if needed
-    // sanitize already validated formatId
-    formatSelector = `${formatId}+bestaudio/${formatId}/best`;
-  }
-
-  const args = [
-    "--no-playlist",
-    "--remote-components",
-    "ejs:github",
-    "-f",
-    formatSelector,
-    "--merge-output-format",
-    "mp4",
-    "--no-warnings",
-    "--no-progress",
-    "--socket-timeout",
-    "20",
-    "--retries",
-    "2",
-    "-o",
-    "-", // stdout
-    url,
-  ];
-
-  // Use spawn without shell
+function spawnJob(args) {
   const proc = spawn(YTDLP_BIN, args, {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
-
-  // Set timeout for whole download (will be killed externally if needed)
-  const timeout = setTimeout(() => {
-    proc.kill("SIGKILL");
+  const timer = setTimeout(() => {
+    try { proc.kill("SIGKILL"); } catch {}
   }, DOWNLOAD_TIMEOUT_MS);
-
-  // Cleanup timeout on exit
-  proc.on("close", () => clearTimeout(timeout));
-  proc.on("error", () => clearTimeout(timeout));
-
+  proc.on("close", () => clearTimeout(timer));
+  proc.on("error", () => clearTimeout(timer));
   return proc;
 }
 
 /**
- * Create audio download stream
- * Supports: best (native), m4a (native), mp3 (via ffmpeg conversion)
- * Returns object { ytdlpProc, ffmpegProc, stream, cleanup, isConversion }
+ * Parse yt-dlp stdout into progress + friendly detail callbacks.
+ * Lines come from --progress-template "download:GACDL %(progress._percent_str)s"
+ * and look like "GACDL  12.3%".
  */
-export function createAudioDownloadStream(rawUrl, options = {}) {
-  const { format = "best" } = options; // mp3, m4a, best
+export function createJobOutputParser({ onProgress, onDetail } = {}) {
+  let buffer = "";
+  return (chunk) => {
+    buffer += chunk.toString("utf8");
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const m = line.match(/GACDL\s+([\d.]+)\s*%/);
+      if (m) {
+        const pct = Number(m[1]);
+        // HLS manifest fetches report 100% before the media download starts.
+        if (onProgress && Number.isFinite(pct) && pct < 99.9) onProgress(pct);
+        continue;
+      }
+      if (!onDetail) continue;
+      if (line.includes("[Merger]")) onDetail("Merging video and audio…");
+      else if (line.includes("[FixupM3u8]")) onDetail("Finalizing MP4 container…");
+      else if (line.includes("[ExtractAudio]")) onDetail("Extracting audio…");
+      else if (line.includes("[Metadata]")) onDetail("Writing metadata…");
+    }
+  };
+}
+
+/**
+ * Build the yt-dlp `-f` selector for a video download.
+ * `plan` comes from buildVideoFormats(); `height` and `formatId` are legacy
+ * fallbacks from the query string.
+ */
+function buildVideoSelector({ plan, height, formatId }) {
+  const suffix = height
+    ? `/best[height<=${height}][protocol*=m3u8]/best[height<=${height}]/best`
+    : "/best[protocol*=m3u8]/best";
+
+  if (plan?.formatIds?.length) {
+    const [videoId, audioId] = plan.formatIds;
+    if (plan.kind === "merge" && audioId) {
+      return `${videoId}+${audioId}/${videoId}+bestaudio[ext=m4a]/${videoId}+bestaudio/${videoId}${suffix}`;
+    }
+    return `${videoId}${suffix}`;
+  }
+
+  if (formatId) {
+    return `${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio/${formatId}${suffix}`;
+  }
+
+  // No explicit selection: best available up to 1080p, HLS first.
+  return `bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080][protocol*=m3u8]/best[height<=1080]/best`;
+}
+
+/**
+ * Start a video download job (video + audio, merged MP4 where needed).
+ * yt-dlp writes the finished file into a temp dir; the caller streams it.
+ */
+export function startVideoDownload(rawUrl, options = {}) {
+  const { plan = null, formatId = null, height = null } = options;
+
+  if (!isYouTubeUrl(rawUrl)) {
+    const err = new Error("Invalid YouTube URL");
+    err.status = 400;
+    throw err;
+  }
+  const url = normalizeYouTubeUrl(rawUrl);
+  const selector = buildVideoSelector({ plan, height, formatId });
+  const tmpDir = makeJobDir();
+
+  const args = [
+    ...YTDLP_JOB_FLAGS,
+    "-f",
+    selector,
+    "--merge-output-format",
+    "mp4",
+    "--socket-timeout",
+    "20",
+    "--retries",
+    "3",
+    "-o",
+    path.join(tmpDir, "media.%(ext)s"),
+    url,
+  ];
+
+  return { proc: spawnJob(args), tmpDir, selector, preferredExts: ["mp4", "mkv", "webm"] };
+}
+
+/**
+ * Start an audio-only download job.
+ * yt-dlp downloads the chosen source and postprocesses with ffmpeg
+ * (-x --audio-format), which produces correct containers/extradata.
+ */
+export function startAudioDownload(rawUrl, options = {}) {
+  const { format = "m4a", quality = null, sourceFormatId = null } = options;
 
   if (!isYouTubeUrl(rawUrl)) {
     const err = new Error("Invalid YouTube URL");
@@ -535,153 +646,101 @@ export function createAudioDownloadStream(rawUrl, options = {}) {
   }
   const url = normalizeYouTubeUrl(rawUrl);
 
-  const normalizedFormat = String(format).toLowerCase().trim();
-  const allowed = new Set(["best", "mp3", "m4a", "aac", "opus", "wav"]);
-  if (!allowed.has(normalizedFormat)) {
-    const err = new Error(`Unsupported audio format "${format}". Supported: mp3, m4a, best`);
+  const requested = String(format).toLowerCase().trim();
+  if (!AUDIO_FORMAT_IDS.has(requested)) {
+    const err = new Error(`Unsupported audio format "${format}". Supported: m4a, mp3, wav, opus`);
     err.status = 400;
     throw err;
   }
 
-  // Determine yt-dlp format selector and output handling
-  // For audio, direct bestaudio often fails with SABR 403 (https DASH). Use HLS video (91-96) as reliable source and extract audio via ffmpeg.
-  // This preserves the HLS fallback used for video and avoids unnecessary re-encode when possible.
-  let ytdlpFormat;
-  let needsConversion = false;
-  let outputExt = normalizedFormat;
-  let ffmpegArgs = null;
+  // Aliases from older clients.
+  const audioFormat = requested === "best" || requested === "high" || requested === "aac" ? "m4a" : requested;
 
-  // HLS video source: try smallest HLS first (91) then larger, fallback to best
-  const hlsFallback = "91/92/93/94/95/96/best";
-
-  if (normalizedFormat === "mp3") {
-    // Use HLS video -> transcode to mp3 192k
-    ytdlpFormat = hlsFallback;
-    needsConversion = true;
-    outputExt = "mp3";
-    ffmpegArgs = [
-      "-i", "pipe:0",
-      "-vn",
-      "-c:a", "libmp3lame",
-      "-b:a", "192k",
-      "-f", "mp3",
-      "pipe:1",
-    ];
-  } else if (normalizedFormat === "m4a" || normalizedFormat === "aac" || normalizedFormat === "high") {
-    // Use HLS video -> extract aac to m4a (fragmented mp4, no re-encode where possible)
-    ytdlpFormat = hlsFallback;
-    outputExt = "m4a";
-    needsConversion = true;
-    ffmpegArgs = [
-      "-i", "pipe:0",
-      "-vn",
-      "-c:a", "copy",
-      "-bsf:a", "aac_adtstoasc",
-      "-f", "mp4",
-      "-movflags", "frag_keyframe+empty_moov",
-      "pipe:1",
-    ];
-    // Fallback to re-encode if copy fails: ffmpeg will handle, but we use copy for efficiency
-  } else if (normalizedFormat === "opus") {
-    ytdlpFormat = "bestaudio[ext=webm]/bestaudio";
-    outputExt = "webm";
-    needsConversion = false;
-  } else {
-    // best - use HLS video and extract best available audio without re-encode if possible
-    // For best, we can offer m4a via copy from HLS (most compatible)
-    ytdlpFormat = hlsFallback;
-    outputExt = "m4a";
-    needsConversion = true;
-    ffmpegArgs = [
-      "-i", "pipe:0",
-      "-vn",
-      "-c:a", "copy",
-      "-bsf:a", "aac_adtstoasc",
-      "-f", "mp4",
-      "-movflags", "frag_keyframe+empty_moov",
-      "pipe:1",
-    ];
+  let mp3Quality = null;
+  if (audioFormat === "mp3") {
+    const q = Number(quality ?? 192);
+    if (!AUDIO_MP3_QUALITIES.has(q)) {
+      const err = new Error(`Unsupported MP3 quality "${quality}". Supported: 320, 192, 128`);
+      err.status = 400;
+      throw err;
+    }
+    mp3Quality = q;
   }
 
-  const ytdlpArgs = [
-    "--no-playlist",
-    "--remote-components",
-    "ejs:github",
+  const selector = sourceFormatId ? `${sourceFormatId}/${AUDIO_SOURCE_LADDER}` : AUDIO_SOURCE_LADDER;
+  const tmpDir = makeJobDir();
+
+  const args = [
+    ...YTDLP_JOB_FLAGS,
     "-f",
-    ytdlpFormat,
-    "--no-warnings",
-    "--no-progress",
+    selector,
+    "-x",
+    "--audio-format",
+    audioFormat,
     "--socket-timeout",
     "20",
     "--retries",
-    "2",
-    "-o",
-    "-",
-    url,
+    "3",
   ];
+  if (mp3Quality) args.push("--audio-quality", `${mp3Quality}K`);
+  args.push("-o", path.join(tmpDir, "audio.%(ext)s"), url);
 
-  // For native m4a/best, we can try to keep original but if best is webm, we still stream webm
-  // No ffmpeg needed, just yt-dlp stdout
-
-  const ytdlpProc = spawn(YTDLP_BIN, ytdlpArgs, {
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
-
-  let ffmpegProc = null;
-  let stream = ytdlpProc.stdout;
-
-  if (needsConversion) {
-    // Spawn ffmpeg to convert pipe:0 -> mp3 pipe:1
-    const FFMPEG_BIN = process.env.FFMPEG_BIN || "ffmpeg";
-    ffmpegProc = spawn(FFMPEG_BIN, ffmpegArgs, {
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-
-    // Pipe yt-dlp stdout to ffmpeg stdin
-    ytdlpProc.stdout.pipe(ffmpegProc.stdin);
-
-    // Handle ffmpeg errors: if ffmpeg fails, kill ytdlp
-    ffmpegProc.on("error", (err) => {
-      ytdlpProc.kill("SIGKILL");
-    });
-    ytdlpProc.on("error", () => {
-      try { ffmpegProc.kill("SIGKILL"); } catch {}
-    });
-
-    stream = ffmpegProc.stdout;
-
-    // Timeout for whole pipeline
-    const timeout = setTimeout(() => {
-      try { ytdlpProc.kill("SIGKILL"); } catch {}
-      try { ffmpegProc.kill("SIGKILL"); } catch {}
-    }, DOWNLOAD_TIMEOUT_MS);
-
-    const clear = () => clearTimeout(timeout);
-    ytdlpProc.on("close", clear);
-    ffmpegProc.on("close", clear);
-    ffmpegProc.on("error", clear);
-    ytdlpProc.on("error", clear);
-
-    return { ytdlpProc, ffmpegProc, stream, isConversion: true, outputExt };
-  }
-
-  // Native - timeout handling
-  const timeout = setTimeout(() => {
-    try { ytdlpProc.kill("SIGKILL"); } catch {}
-  }, DOWNLOAD_TIMEOUT_MS);
-  ytdlpProc.on("close", () => clearTimeout(timeout));
-  ytdlpProc.on("error", () => clearTimeout(timeout));
-
-  return { ytdlpProc, ffmpegProc: null, stream, isConversion: false, outputExt };
+  return { proc: spawnJob(args), tmpDir, selector, outputExt: audioFormat, preferredExts: [audioFormat] };
 }
 
 /**
- * Helper to get sanitized title for filename (quick info fetch)
- * Uses getVideoInfo internally but with lighter parsing
+ * Find the finished media file inside a job directory.
+ * Ignores yt-dlp partial/downloader artifacts and returns { path, size, ext }.
  */
-export async function getTitleForFilename(rawUrl) {
-  const info = await getVideoInfo(rawUrl);
-  return info.title;
+export function findOutputFile(tmpDir, preferredExts = []) {
+  let names;
+  try {
+    names = fs.readdirSync(tmpDir);
+  } catch {
+    return null;
+  }
+  const files = names.filter((n) => !/\.(part|ytdl|temp|tmp)$/i.test(n));
+  if (files.length === 0) return null;
+
+  const rank = (name) => {
+    const ext = name.split(".").pop().toLowerCase();
+    const i = preferredExts.indexOf(ext);
+    return i === -1 ? preferredExts.length + 1 : i;
+  };
+  files.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+
+  const filePath = path.join(tmpDir, files[0]);
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size === 0) return null;
+    return { path: filePath, size: stat.size, ext: files[0].split(".").pop().toLowerCase() };
+  } catch {
+    return null;
+  }
+}
+
+/** Remove a job directory (best effort, retries while files are still open). */
+export function cleanupJobDir(tmpDir) {
+  if (!tmpDir) return;
+  const attempt = (remaining) => {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      if (remaining > 0) setTimeout(() => attempt(remaining - 1), 250);
+    }
+  };
+  attempt(3);
+}
+
+/** Kill a spawned yt-dlp/ffmpeg process and its children. */
+export function killProcessTree(proc) {
+  if (!proc || proc.killed) return;
+  try {
+    if (process.platform === "win32") {
+      try { execSync(`taskkill /PID ${proc.pid} /T /F`, { stdio: "ignore" }); } catch {}
+    } else {
+      try { process.kill(-proc.pid, "SIGKILL"); } catch {}
+    }
+  } catch {}
+  try { proc.kill("SIGKILL"); } catch {}
 }

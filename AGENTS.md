@@ -6,59 +6,51 @@ Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader bac
 
 - `npm run dev` — server with reload (`node --watch server/index.js`) at http://localhost:3000
 - `npm start` — run server
-- `npm test` — `node --test test/*.test.js` (Node's built-in runner). **There is currently no `test/` directory: a green run means 0 tests, not passing tests.**
+- `npm test` — `node --test test/*.test.js`; pure unit tests (validator, format planner, progress parser, error classifier, download status, transcript normalizer). No network required.
 - Single test: `node --test test/<file>.test.js`; filter: `node --test --test-name-pattern="name" test/<file>.test.js`
-- No lint / format / typecheck is configured — do not invent commands. Syntax check: `node --check <file>`.
-- Smoke test: `npm run dev`, then `GET http://localhost:3000/api/health` → `{ status: "ok", ytDlp: ... }` (also confirms the yt-dlp binary resolves).
+- No lint / format / typecheck / CI is configured — do not invent commands. Syntax check: `node --check <file>`.
+- Smoke test: `npm start`, then `GET http://localhost:3000/api/health` → `{ status: "ok", ytDlp: <configured name> }` (it only echoes the setting; it does not check that the binary exists).
 
 ## Runtime prerequisites
 
-- `yt-dlp` on PATH (override: `YTDLP_BIN`) — required for all API features.
-- `ffmpeg` on PATH (override: `FFMPEG_BIN`) — required for audio downloads. Not mentioned in `.env.example`.
-- Copy `.env.example` → `.env`. With no `OPENAI_API_KEY`, the AI provider silently falls back to `MockProvider` (responses flagged `isFallback: true`).
-
-## Status: done vs. remaining (assessed 2026-10-15)
-
-Shipped — 5 phases across 6 commits (last commit 2026-08-26):
-- Video info + quality picker + streamed MP4 download with friendly yt-dlp error mapping (`server/routes/download.js`).
-- Intelligence: English transcript + AI summary (OpenAI-compatible or mock provider).
-- Audio: `mp3`/`m4a`/`aac`/`best` all route through HLS (`91/92/...`) + ffmpeg; `opus` is the only native (no-ffmpeg) path (`server/services/ytdlp.js`).
-- Reliability: client disconnect → process-tree kill, duplicate-download 429, 30s info / 5min download timeouts, abortable info fetch, in-memory status polled by the UI.
-- Premium dark UI with byte-level progress + cancel (`public/`).
-
-Remaining work to consider "complete" (no roadmap file exists — derived from repo gaps plus live verification on 2026-10-15 with yt-dlp 2026.07.04, ffmpeg 9.0, running `npm start`):
-
-Verified bugs (reproduced live):
-1. **Audio `format=high` always 400s.** The route's allowed set includes `"high"` but `createAudioDownloadStream`'s does not, so it rejects after a full info fetch (~11s). The service's `"high"` branch is unreachable dead code. The UI offers "High" whenever best-m4a differs from best — those clicks fail.
-2. **Audio `wav` mislabels output.** Route ignores the service's returned `outputExt` (service produces m4a for `wav`) and sends `.wav` / `audio/wav` headers around m4a bytes. Fix: honor `result.outputExt`, or drop `wav` from both allowed sets.
-
-Environment / upstream (checked before blaming app code):
-3. **Media-data 403s are YouTube-side, not the app.** Plain `yt-dlp` on this machine also fails `unable to download video data: HTTP Error 403` (formats 18 and 401) while `--dump-json` info works; one default download 403'd after 61MB. Suspects: IP/bot blocking, need `--extractor-args "youtube:player_client=..."` or cookies. Log shows yt-dlp solving JS challenges via **deno** (`[jsc:deno]`) — deno is a soft runtime dependency here.
-4. **Rapid repeated info fetches get throttled** — successive `/api/info` calls slowed 3.7s→30s+ until `INFO_TIMEOUT_MS` produced route-level 504s. Don't treat a 504 under test load as a regression without a cool-down retry.
-
-Other gaps:
-5. **Tests** — none exist; `npm test` passes vacuously. Best first targets: `shared/validator.js`, `sanitizeFilename`/`validateDownloadQuery` (`server/utils/validation.js`), `normalizeTranscriptContent` (`server/services/transcript.js`) — all already exported; error mapping and `buildFormats` in `ytdlp.js` would need exporting first.
-6. **README** — none. `.env.example` also omits `FFMPEG_BIN`.
-7. **Stale metadata** — `package.json` `description` still says "Phase 1: Core Downloader".
-8. **Abuse protection** — no rate limiting anywhere; the server proxies YouTube fetches for any client. Required before any public deploy (plus: `downloadStatus` Map is lost on restart).
-9. **Verify `Content-Length`** — set from the selected format's `filesize`, but the stream is `formatId+bestaudio` merged, so the real byte count can differ (`X-Expected-Size` only drives the progress bar). Unverified live — downloads 403'd (item 3).
-10. **Transcript gaps** — `--sub-langs en` only; the any-language fallback pass exists only as comments, unimplemented (`server/services/transcript.js`); `isAuto` is hardcoded `true`.
-11. **No CI / lint** (see Commands — none configured).
+- `yt-dlp` on PATH (override: `YTDLP_BIN`) — required for all API features. `YTDLP_BIN` is read at module import in `ytdlp.js`/`transcript.js` (set it before importing in tests); `FFMPEG_BIN` is read per call.
+- `ffmpeg` on PATH (override: `FFMPEG_BIN`) — required for every audio download (`-x --audio-format …`) and for merging MP4 video. Both overrides are documented in `.env.example` (a missing `.env` is fine; defaults are the bare binary names).
+- Copy `.env.example` → `.env`. Without `OPENAI_API_KEY`/`AI_API_KEY`, the AI provider silently falls back to `MockProvider` (intelligence responses flagged `isFallback: true`) — `server/services/ai/factory.js`.
+- yt-dlp runs with `--remote-components ejs:github`; JS challenges resolve via **deno** (`[jsc:deno]` in logs) — a soft runtime dependency.
 
 ## Layout
 
-- `server/index.js` — entrypoint; mounts `/api/*` routes, serves `public/` statically, SPA fallback for other paths (Express **4** syntax `app.get("*")`).
-- `server/routes/` — HTTP layer; `server/services/` — yt-dlp, transcript, AI logic; `server/utils/` — validation + download status.
-- `shared/validator.js` — canonical URL validation (re-exported by `server/utils/validation.js`).
+- `server/index.js` — entrypoint; mounts `/api/*`, serves `public/` and `/shared` statically, SPA fallback for other paths (Express **4** syntax `app.get("*")`).
+- Endpoints: POST `/api/info`, POST `/api/intelligence`, GET `/api/download` (video), GET `/api/download/audio`, GET `/api/downloads/status`, GET `/api/health`.
+- `server/routes/` — HTTP layer; `server/services/` — yt-dlp jobs, transcript, AI logic; `server/utils/` — validation + download status; `test/` — `node:test` unit tests.
+- `shared/validator.js` — canonical URL validation (re-exported by `server/utils/validation.js`) and imported directly by `public/app.js` as `/shared/validator.js` (mounted in `server/index.js`).
+
+## How downloads work (rewritten 2026-10-19)
+
+1. `GET /api/download?url=…&height=720` (legacy `formatId=` still accepted) fetches info, resolves a per-height **plan** (`buildVideoFormats` in `server/services/ytdlp.js`) and starts a yt-dlp job for video **with audio**.
+   - Plan preference per height: muxed **HLS** variant → **merge** (DASH video-only + best m4a audio) → progressive (last resort; the most 403-prone).
+   - Heights are capped at 1080p (UI list: 1080/720/480/360/240/144).
+2. `GET /api/download/audio?url=…&format=m4a|mp3|wav|opus&quality=320|192|128` starts an audio-only job; UI offers M4A / MP3 320/192/128 / WAV. Source: HLS ladder `93/94/95/96/92/91` (AAC-LC 128k preferred over HE-AAC), falling back to `bestaudio`. `best`/`high`/`aac` are aliases for `m4a`.
+3. Jobs are **file based**: yt-dlp writes into a temp dir (`os.tmpdir()/grabaclip/job-*`, deleted afterwards) so it can run its own postprocessing — TS→MP4 fixup for HLS, `--merge-output-format mp4`, `-x --audio-format …` via ffmpeg. Piping to stdout is what used to produce MPEG-TS files named `.mp4` and extradata-less M4A — do not go back to piping.
+4. When yt-dlp exits 0 the finished file is streamed to the client with an exact `Content-Length`; the temp dir is removed once the response (or a client abort) finishes.
+5. Progress: `--progress-template "download:GACDL %(progress._percent_str)s"` (the `download:` prefix is the template TYPE and is not printed) is parsed from stdout into `/api/downloads/status` (`progress`, `detail`). Phases: `preparing → fetching → processing → downloading → complete|failed`; the UI polls this while waiting for response headers.
 
 ## Gotchas
 
-- `public/app.js` contains an **inline duplicate** of `shared/validator.js` (comment says "mirrors shared/validator.js"). Validation changes must be made in both files; nothing enforces sync.
 - Services signal HTTP status via an `err.status` property; routes respond `e.status || 500`. New service errors without `.status` surface as generic 500s.
-- Audio downloads intentionally use HLS video formats (`91/92/...`) piped through ffmpeg instead of `bestaudio` — direct bestaudio hits SABR/403 errors. Do not "simplify" this.
-- Download status (`server/utils/downloadStatus.js`) is an in-memory Map — resets on server restart; concurrent duplicate downloads for the same video+type return HTTP 429.
-- Downloads stream yt-dlp stdout straight to the response (no temp files); client disconnects kill the process tree (`taskkill /T /F` on Windows).
-- yt-dlp stderr is pattern-matched into friendly errors in `classifyYtDlpError` (`server/services/ytdlp.js`) **and again** in the `download.js` close handler — keep both in sync when changing error messages.
-- Timeouts: info fetch 30s, download 5min (`server/services/ytdlp.js`).
-- `.env` and media artifacts (`*.mp4`, `*.part`, `*.vtt`, `*.srt`) are gitignored — never commit them.
-- Commits follow conventional style (`feat: ...`, `fix: ...`).
+- Media-data 403s are YouTube-side (bot/IP checks), per-video; HLS usually keeps working while DASH/progressive formats 403. `classifyYtDlpError` maps them to 502 with a retry message. Compare against a plain yt-dlp run before blaming app code.
+- Download status (`server/utils/downloadStatus.js`) is an in-memory Map — lost on restart; duplicate downloads for the same video+type return 429 while a job runs. Entries linger (complete/failed) for up to 10 min (`cleanupStale`).
+- Cancelling: a client disconnect kills the yt-dlp process tree with `taskkill /T /F` — **Windows only** in practice: `spawn` is not `detached`, so the POSIX `kill(-pid)` branch degrades to killing just the direct child.
+- `cleanupJobDir` retries (3×, 250 ms) because Windows keeps the media file locked briefly after the process exits.
+- `classifyYtDlpError` (`server/services/ytdlp.js`) is the **single** source of friendly error strings — routes call it, they do not re-implement matching. Covered by `test/ytdlp.test.js`.
+- Timeouts: info 30s, transcript 30s, download jobs 20 min (`DOWNLOAD_TIMEOUT_MS` in `ytdlp.js` / `transcript.js`).
+- `.env` and media artifacts (`*.mp4`, `*.part`, `*.vtt`, `*.srt`) are gitignored — never commit them. Commits use conventional style (`feat: ...`, `fix: ...`).
+
+## Known issues (verified 2026-10-19)
+
+- Each download also performs an info (`--dump-json`) fetch, so a job takes one extra yt-dlp round trip before it starts.
+- Rapid repeated `/api/info` calls get throttled and can 504 at the 30s info timeout — cool down before treating as a regression.
+- Transcripts: `--sub-langs en` only; the any-language fallback exists only as comments; `isAuto` is hardcoded `true` (`server/services/transcript.js`).
+- Large downloads are written to disk twice (YouTube → temp file, temp file → client); an aborted job may briefly leave a `grabaclip/job-*` dir behind until cleanup retries.
+- No rate limiting anywhere; the server proxies YouTube fetches for any client — required before public deploy.
+- The frontend buffers the whole file in memory (blob) before saving, so very large 1080p downloads cost RAM on the client.

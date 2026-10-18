@@ -1,12 +1,21 @@
 import { Router } from "express";
-import { execSync } from "node:child_process";
+import fs from "node:fs";
 import { validateDownloadQuery, sanitizeFilename, sanitizeAsciiFilename } from "../utils/validation.js";
-import { createDownloadStream, getVideoInfo } from "../services/ytdlp.js";
-import { startDownload, setPhase, completeDownload, failDownload, isActive, removeDownload } from "../utils/downloadStatus.js";
+import {
+  startVideoDownload,
+  getVideoInfo,
+  classifyYtDlpError,
+  createJobOutputParser,
+  findOutputFile,
+  cleanupJobDir,
+  killProcessTree,
+  MIME_BY_EXT,
+} from "../services/ytdlp.js";
+import { startDownload, setPhase, setProgressDetail, completeDownload, failDownload, isActive, removeDownload } from "../utils/downloadStatus.js";
 
 const router = Router();
 
-// GET /api/download?url=...&formatId=...
+// GET /api/download?url=...&height=720 (or legacy formatId=...)
 router.get("/", async (req, res) => {
   const validation = validateDownloadQuery(req.query);
 
@@ -14,73 +23,36 @@ router.get("/", async (req, res) => {
     return res.status(400).json({ error: validation.error });
   }
 
-  const { normalizedUrl, formatId, isHeight } = validation;
+  const { normalizedUrl, height, formatId } = validation;
 
-  // Prevent duplicate active downloads for same video + quality
+  // Prevent duplicate active downloads for same video
   if (isActive("video", normalizedUrl)) {
     return res.status(429).json({ error: "A download for this video is already in progress. Please wait or refresh the page." });
   }
 
-  const status = startDownload("video", normalizedUrl);
+  startDownload("video", normalizedUrl);
 
   let title = "video";
-  let effectiveFormatId = formatId;
-  let effectiveIsHeight = isHeight;
   let info = null;
   const abortController = new AbortController();
-  let clientAborted = false;
-  const onClientAbort = () => {
-    clientAborted = true;
+  let clientGone = false;
+  const onClientAbortInfo = () => {
+    clientGone = true;
     try { abortController.abort(); } catch {}
   };
-  req.on("close", onClientAbort);
-  req.on("aborted", onClientAbort);
+  req.on("close", onClientAbortInfo);
+  req.on("aborted", onClientAbortInfo);
 
   setPhase("video", normalizedUrl, "fetching");
   try {
     info = await getVideoInfo(normalizedUrl, { signal: abortController.signal });
-    if (clientAborted) {
-      console.log("[download] client aborted during info fetch, aborting");
+    if (clientGone) {
       removeDownload("video", normalizedUrl);
       return;
     }
     title = info.title;
-
-    if (formatId && !isHeight) {
-      const exists = info.formats.some((f) => f.formatId === formatId);
-      if (!exists) {
-        failDownload("video", normalizedUrl, `Format "${formatId}" is not available.`);
-        return res.status(400).json({ error: `Requested format "${formatId}" is not available. Please choose another quality.` });
-      }
-    }
-    if (formatId && isHeight) {
-      const heightNum = parseInt(formatId, 10);
-      const maxHeight = Math.max(...info.formats.map((f) => f.height), 0);
-      if (heightNum > maxHeight + 100) {
-        console.warn(`[download] requested height ${heightNum} higher than max ${maxHeight}, will fallback to best`);
-      }
-
-      let matched = info.formats.find((f) => f.height === heightNum);
-      if (!matched) {
-        const sorted = [...info.formats].sort((a, b) => b.height - a.height);
-        matched = sorted.find((f) => f.height <= heightNum) || sorted[sorted.length - 1];
-        if (matched) {
-          console.log(`[download] height ${heightNum} mapped to format ${matched.formatId} (${matched.height}p, proto=${matched.protocol})`);
-        }
-      } else {
-        console.log(`[download] height ${heightNum} exact match -> format ${matched.formatId} proto=${matched.protocol}`);
-      }
-
-      if (matched) {
-        effectiveFormatId = matched.formatId;
-        effectiveIsHeight = false;
-      } else {
-        console.warn(`[download] no format matched for height ${heightNum}, using height selector`);
-      }
-    }
   } catch (e) {
-    if (e.code === "ABORTED" || e.status === 499 || clientAborted) {
-      console.log("[download] aborted during info fetch");
+    if (e.code === "ABORTED" || e.status === 499 || clientGone) {
       removeDownload("video", normalizedUrl);
       return;
     }
@@ -90,223 +62,167 @@ router.get("/", async (req, res) => {
     failDownload("video", normalizedUrl, message);
     return res.status(status).json({ error: message });
   } finally {
-    try { req.off("close", onClientAbort); req.off("aborted", onClientAbort); } catch {}
+    try { req.off("close", onClientAbortInfo); req.off("aborted", onClientAbortInfo); } catch {}
   }
 
-  if (clientAborted || req.destroyed || res.writableEnded) {
-    console.log("[download] client already disconnected before download, aborting");
+  if (clientGone || req.destroyed || res.writableEnded) {
     removeDownload("video", normalizedUrl);
     return;
   }
 
-  const safeName = sanitizeFilename(title);
-  const filename = `${safeName}.mp4`;
-  const encoded = encodeURIComponent(filename);
-  const asciiFallback = sanitizeAsciiFilename(safeName);
-
-  let expectedSize = null;
-  try {
-    const bestMatch = info.formats.find((f) => f.formatId === effectiveFormatId);
-    if (bestMatch && bestMatch.filesize) expectedSize = bestMatch.filesize;
-  } catch {}
-
-  let headersSent = false;
-  function sendDownloadHeaders() {
-    if (headersSent) return;
-    headersSent = true;
-    res.status(200);
-    res.setHeader("Content-Type", "video/mp4");
-    try {
-      res.setHeader("Content-Disposition", `attachment; filename="${asciiFallback}.mp4"; filename*=UTF-8''${encoded}`);
-    } catch (e) {
-      console.error("[download] header set failed, using fallback", e.message);
-      res.setHeader("Content-Disposition", `attachment; filename="video.mp4"`);
+  // Resolve what to download:
+  //  - explicit height -> matching plan from the info response
+  //  - no selection    -> best available plan (<= 1080p)
+  //  - legacy formatId -> raw yt-dlp selection
+  let plan = null;
+  if (height != null) {
+    plan = info.formats.find((f) => f.height === height) || null;
+    if (!plan) {
+      const available = info.formats.map((f) => f.label).join(", ") || "none";
+      const message = `${height}p is not available for this video. Available qualities: ${available}.`;
+      failDownload("video", normalizedUrl, message);
+      return res.status(400).json({ error: message });
     }
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    if (expectedSize) {
-      res.setHeader("Content-Length", String(expectedSize));
-      res.setHeader("X-Expected-Size", String(expectedSize));
-    }
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Disposition, X-Expected-Size");
+  } else if (!formatId) {
+    plan = info.formats[0] || null;
   }
 
   setPhase("video", normalizedUrl, "processing");
+  setProgressDetail("video", normalizedUrl, 0, "Starting download…");
 
-  let downloadProc;
+  let job;
   try {
-    downloadProc = createDownloadStream(normalizedUrl, { formatId: effectiveFormatId, isHeight: effectiveIsHeight });
+    job = startVideoDownload(normalizedUrl, { plan, formatId, height });
   } catch (e) {
-    console.error("[download] create stream failed:", e.message);
+    console.error("[download] failed to start job:", e.message);
     failDownload("video", normalizedUrl, e.message);
-    if (!res.headersSent) {
-      return res.status(e.status || 500).json({ error: e.message });
-    }
-    return res.end();
+    return res.status(e.status || 500).json({ error: e.message });
   }
 
+  const { proc: downloadProc, tmpDir } = job;
   let stderr = "";
-  let hasStartedStreaming = false;
-  let errorSent = false;
+  let fileStream = null;
+  let finished = false;
+  let jobCleaned = false;
+
+  const finishCleanup = () => {
+    if (jobCleaned) return;
+    jobCleaned = true;
+    cleanupJobDir(tmpDir);
+  };
+
+  const onClientGone = () => {
+    if (finished || clientGone) return;
+    clientGone = true;
+    killProcessTree(downloadProc);
+    if (fileStream) fileStream.destroy();
+    else finishCleanup();
+    removeDownload("video", normalizedUrl);
+    console.log(`[download] client disconnected; job cancelled for ${normalizedUrl}`);
+  };
+
+  req.on("close", onClientGone);
+  req.on("aborted", onClientGone);
+  req.on("error", onClientGone);
+  res.on("close", onClientGone);
+  res.on("error", onClientGone);
+  res.on("finish", () => {
+    finished = true;
+    completeDownload("video", normalizedUrl);
+    console.log(`[download] delivered ${normalizedUrl} height=${height || "auto"}`);
+  });
+
+  const parseProgress = createJobOutputParser({
+    onProgress: (pct) => setProgressDetail("video", normalizedUrl, pct, `Downloading from YouTube… ${Math.round(pct)}%`),
+    onDetail: (text) => setProgressDetail("video", normalizedUrl, null, text),
+  });
+  downloadProc.stdout.on("data", parseProgress);
 
   downloadProc.stderr.on("data", (chunk) => {
     stderr += chunk.toString("utf-8");
     if (stderr.length > 8192) stderr = stderr.slice(-8192);
   });
-
-  // Backend reliability: ensure yt-dlp (and its ffmpeg child) cannot remain after disconnect
-  let cleaned = false;
-  const killProcTree = (proc) => {
-    if (!proc || proc.killed) return;
-    try {
-      if (process.platform === "win32") {
-        try { execSync(`taskkill /PID ${proc.pid} /T /F`, { stdio: "ignore" }); } catch {}
-      } else {
-        try { process.kill(-proc.pid, "SIGKILL"); } catch {}
-      }
-    } catch {}
-    try { proc.kill("SIGKILL"); } catch {}
-  };
-  const onClose = () => {
-    if (cleaned) return;
-    cleaned = true;
-    try {
-      if (downloadProc && !downloadProc.killed) {
-        killProcTree(downloadProc);
-        console.log("[download] killed yt-dlp due to client disconnect");
-      }
-    } catch {}
-    if (!hasStartedStreaming) {
-      failDownload("video", normalizedUrl, "Download cancelled");
-    }
-    cleanup();
-  };
-  const onReqAborted = () => {
-    console.log("[download] req aborted");
-    onClose();
-  };
-  req.on("close", onClose);
-  req.on("aborted", onReqAborted);
-  req.on("error", onClose);
-  res.on("close", onClose);
-  res.on("error", onClose);
-  res.on("finish", () => {
-    cleaned = true;
-    if (hasStartedStreaming) {
-      completeDownload("video", normalizedUrl);
-    }
-    cleanup();
-  });
-
-  let stdoutEnded = false;
-  let lastByteTime = Date.now();
-
-  downloadProc.stdout.on("data", (chunk) => {
-    lastByteTime = Date.now();
-    if (!headersSent) {
-      setPhase("video", normalizedUrl, "downloading");
-      sendDownloadHeaders();
-    }
-    hasStartedStreaming = true;
-    try {
-      const ok = res.write(chunk);
-      if (!ok) {
-        downloadProc.stdout.pause();
-        res.once("drain", () => {
-          try { downloadProc.stdout.resume(); } catch {}
-        });
-      }
-    } catch (e) {
-      console.error("[download] res.write failed (broken pipe)", e.message);
-      onClose();
-    }
-  });
-
-  downloadProc.stdout.on("error", (err) => {
-    console.error("[download] stdout error", err.message);
-    if (!headersSent && !res.headersSent && !res.writableEnded) {
-      res.status(502).json({ error: "Download streaming error." });
-    }
-  });
-
-  downloadProc.stderr.on("error", (err) => {
-    console.error("[download] stderr error", err.message);
-  });
-
-  downloadProc.stdout.on("end", () => {
-    stdoutEnded = true;
-  });
+  downloadProc.stderr.on("error", (err) => console.error("[download] stderr error", err.message));
+  downloadProc.stdout.on("error", (err) => console.error("[download] stdout error", err.message));
 
   downloadProc.on("error", (err) => {
-    console.error("[download] proc error:", err.message);
+    console.error("[download] process error:", err.message);
     failDownload("video", normalizedUrl, err.message);
-    cleanup();
-    if (!headersSent && !res.headersSent) {
+    finishCleanup();
+    if (!res.headersSent && !res.writableEnded) {
       res.status(500).json({ error: "Download failed due to server error." });
-    } else if (!hasStartedStreaming) {
-      if (!res.writableEnded) res.end();
-    } else {
-      if (!res.writableEnded) res.end();
+    } else if (!res.writableEnded) {
+      res.end();
     }
   });
 
   downloadProc.on("close", (code) => {
-    cleanup();
-    const lower = stderr.toLowerCase();
-
-    if (code === 0) {
-      if (hasStartedStreaming) {
-        if (!res.writableEnded) res.end();
-      } else {
-        console.error(`[download] yt-dlp exited 0 but no data streamed:`, stderr.slice(0, 500));
-        failDownload("video", normalizedUrl, "Download produced no data");
-        if (!headersSent && !res.headersSent && !res.writableEnded) {
-          res.status(502).json({ error: "Download produced no data. Please try a different quality." });
-        } else if (!res.writableEnded) {
-          res.end();
-        }
-      }
-      console.log(`[download] completed for ${normalizedUrl} format=${effectiveFormatId || "best"} hasStreamed=${hasStartedStreaming}`);
+    if (clientGone) {
+      finishCleanup();
       return;
     }
 
-    console.error(`[download] yt-dlp exited code ${code}:`, stderr.slice(0, 500));
-
-    if (!hasStartedStreaming) {
-      if (!headersSent && !res.headersSent) {
-        let status = 500;
-        let message = "Download failed. Please try again.";
-        if (lower.includes("video unavailable")) { status = 404; message = "Video unavailable."; }
-        else if (lower.includes("private video")) { status = 403; message = "This video is private."; }
-        else if (
-          lower.includes("confirm your age") ||
-          lower.includes("age-restricted") ||
-          lower.includes("age restricted") ||
-          lower.includes("inappropriate for some users") ||
-          (lower.includes("sign in") && lower.includes("age")) ||
-          lower.includes("login required") ||
-          lower.includes("requires authentication")
-        ) { status = 403; message = "This video is age-restricted or requires sign-in."; }
-        else if (lower.includes("members-only") || lower.includes("members only") || lower.includes("join this channel")) { status = 403; message = "This video is members-only or requires purchase."; }
-        else if (lower.includes("copyright") || lower.includes("blocked")) { status = 403; message = "This video is blocked due to copyright or regional restrictions."; }
-        else if (lower.includes("requested format not available") || lower.includes("format not found")) { status = 400; message = "Requested quality not available. Please choose another quality."; }
-        else if (lower.includes("unsupported url")) { status = 400; message = "Unsupported URL."; }
-        else if (lower.includes("http error 403") || lower.includes("forbidden")) { status = 502; message = "This quality is temporarily unavailable (403). Please try a different quality (e.g., 720p or 480p)."; }
-        else if (lower.includes("unable to download")) { status = 502; message = "Failed to download video data. Please try a different quality."; }
-
-        failDownload("video", normalizedUrl, message);
-        if (!res.writableEnded) res.status(status).json({ error: message, details: stderr.slice(0, 300) });
-      } else {
-        if (!res.writableEnded) res.end();
+    if (code !== 0) {
+      console.error(`[download] yt-dlp exited ${code}:`, stderr.slice(0, 500));
+      const classified = classifyYtDlpError(stderr, code);
+      failDownload("video", normalizedUrl, classified.message);
+      finishCleanup();
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(classified.status).json({ error: classified.message, details: stderr.slice(0, 300) });
+      } else if (!res.writableEnded) {
+        res.end();
       }
-    } else {
-      if (!res.writableEnded) res.end();
+      return;
     }
-  });
 
-  function cleanup() {
-    req.off("close", onClose);
-    res.off("close", onClose);
-  }
+    const output = findOutputFile(tmpDir, job.preferredExts);
+    if (!output) {
+      console.error(`[download] yt-dlp finished but no media file found:`, stderr.slice(0, 500));
+      const message = "Download produced no media file. Please try another quality.";
+      failDownload("video", normalizedUrl, message);
+      finishCleanup();
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(502).json({ error: message });
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+      return;
+    }
+
+    const ext = output.ext || "mp4";
+    const safeName = sanitizeFilename(title);
+    const filename = `${safeName}.${ext}`;
+    const encoded = encodeURIComponent(filename);
+    const asciiFallback = sanitizeAsciiFilename(safeName);
+
+    setPhase("video", normalizedUrl, "downloading");
+    setProgressDetail("video", normalizedUrl, 100, "Sending file…");
+
+    res.status(200);
+    res.setHeader("Content-Type", MIME_BY_EXT[ext] || "video/mp4");
+    try {
+      res.setHeader("Content-Disposition", `attachment; filename="${asciiFallback}.${ext}"; filename*=UTF-8''${encoded}`);
+    } catch (e) {
+      console.error("[download] header set failed, using fallback", e.message);
+      res.setHeader("Content-Disposition", `attachment; filename="video.${ext}"`);
+    }
+    res.setHeader("Content-Length", String(output.size));
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Disposition");
+
+    fileStream = fs.createReadStream(output.path);
+    fileStream.on("error", (err) => {
+      console.error("[download] file stream error:", err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Failed to read the downloaded media file." });
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+      finishCleanup();
+    });
+    fileStream.on("close", finishCleanup);
+    fileStream.pipe(res);
+  });
 });
 
 export default router;
