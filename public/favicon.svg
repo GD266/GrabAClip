@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Grab a Clip">
+  <rect width="64" height="64" rx="14" fill="#09090b"/>
+  <rect x="14" y="14" width="36" height="36" rx="9" fill="none" stroke="#f4f4f5" stroke-width="3.2"/>
+  <path d="M27.5 23.8 41.5 32l-14 8.2V23.8Z" fill="#f4f4f5"/>
+</svg>

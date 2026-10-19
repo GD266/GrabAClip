@@ -31,6 +31,12 @@ test("index.html loads config.js before the app module", () => {
   assert.ok(configIndex < appIndex, "config.js must load before app.js");
 });
 
+test("index.html points at the Grab a Clip favicon", () => {
+  const html = read("public/index.html");
+  assert.match(html, /<link[^>]+rel="icon"[^>]+href="\/favicon\.svg"[^>]+type="image\/svg\+xml"/);
+  assert.match(read("public/favicon.svg"), /<svg[^>]+viewBox="0 0 64 64"/);
+});
+
 test("config.js exposes the API base global", () => {
   assert.match(read("public/config.js"), /window\.GAC_API_BASE\s*=/);
 });
