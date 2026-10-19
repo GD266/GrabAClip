@@ -1,5 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 
 import {
   buildVideoFormats,
@@ -7,6 +12,12 @@ import {
   pickAudioSource,
   classifyYtDlpError,
   createJobOutputParser,
+  buildVideoAttempts,
+  buildAudioAttempts,
+  isFatalDownloadError,
+  runMediaJob,
+  startVideoDownload,
+  cleanupJobDir,
 } from "../server/services/ytdlp.js";
 
 // ---------------------------------------------------------------------------
@@ -268,4 +279,176 @@ test("createJobOutputParser ignores the manifest 100% line and reports phases", 
 test("classifyYtDlpError handles timeouts", () => {
   const r = classifyYtDlpError("", "TIMEOUT");
   assert.equal(r.status, 504);
+});
+
+// ---------------------------------------------------------------------------
+// Fallback attempts (buildVideoAttempts / buildAudioAttempts)
+// ---------------------------------------------------------------------------
+
+test("buildVideoFormats attaches ordered fallback selectors to every plan", () => {
+  const [plan] = buildVideoFormats([dashVideo240, dashAudio140]);
+  assert.deepEqual(plan.selectors, [
+    "133+140",
+    "133+bestaudio[ext=m4a]/133+bestaudio",
+    "best[height=240][protocol*=m3u8]",
+    "best[height<=240][protocol*=m3u8]/best[height<=240]",
+  ]);
+});
+
+test("buildVideoAttempts starts with the plan's preferred source and retries it", () => {
+  const [plan] = buildVideoFormats([dashVideo240, dashAudio140]);
+  const attempts = buildVideoAttempts({ plan, height: 240 });
+
+  assert.equal(attempts[0].selector, "133+140");
+  assert.equal(attempts[1].selector, "133+140", "second attempt retries the preferred source");
+  assert.ok(attempts[1].delayMs > 0, "retry waits briefly before re-extracting");
+  assert.ok(attempts.length <= 7);
+  assert.ok(attempts.every((a) => typeof a.selector === "string" && a.selector.length > 0));
+});
+
+test("buildVideoAttempts ends with alternate YouTube player clients", () => {
+  const attempts = buildVideoAttempts({ height: 720 });
+  const clients = attempts.flatMap((a) => a.extractorArgs || []);
+  assert.ok(clients.some((c) => c.includes("web_safari")));
+  assert.ok(clients.some((c) => c.includes("player_client=tv")));
+});
+
+test("buildVideoAttempts supports the legacy raw formatId selection", () => {
+  const attempts = buildVideoAttempts({ formatId: "137", height: 1080 });
+  assert.match(attempts[0].selector, /^137\+/);
+});
+
+test("buildAudioAttempts tries the preferred source, then audio-only and player fallbacks", () => {
+  const attempts = buildAudioAttempts({ sourceFormatId: "93" });
+  assert.match(attempts[0].selector, /^93\//);
+  assert.equal(attempts[1].selector, attempts[0].selector);
+  assert.ok(attempts.some((a) => a.selector.startsWith("bestaudio")));
+  assert.ok(attempts.some((a) => (a.extractorArgs || []).some((c) => c.includes("web_safari"))));
+});
+
+test("buildAudioAttempts works without a detected source", () => {
+  const attempts = buildAudioAttempts({});
+  assert.ok(attempts.length >= 3);
+  assert.ok(attempts[0].selector.includes("bestaudio"));
+});
+
+// ---------------------------------------------------------------------------
+// isFatalDownloadError
+// ---------------------------------------------------------------------------
+
+test("isFatalDownloadError marks unavailable/private videos as fatal but not 403s", () => {
+  assert.equal(isFatalDownloadError("ERROR: Video unavailable"), true);
+  assert.equal(isFatalDownloadError("ERROR: Private video. Sign in if you've been granted access"), true);
+  assert.equal(isFatalDownloadError("ERROR: Sign in to confirm your age"), true);
+
+  // Blocked media URLs and missing formats must stay retryable.
+  assert.equal(isFatalDownloadError("ERROR: unable to download video data: HTTP Error 403: Forbidden"), false);
+  assert.equal(isFatalDownloadError("ERROR: Requested format is not available"), false);
+  assert.equal(isFatalDownloadError(""), false);
+});
+
+test("startVideoDownload refuses missing selectors", () => {
+  assert.throws(
+    () => startVideoDownload("https://www.youtube.com/watch?v=dQw4w9WgXcQ", {}),
+    /selector/i
+  );
+});
+
+// ---------------------------------------------------------------------------
+// runMediaJob (fake processes, no network)
+// ---------------------------------------------------------------------------
+
+function makeFakeJob({ code, stderr = "", produce = null, delay = 10 } = {}) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gac-fake-"));
+  const proc = new EventEmitter();
+  proc.stdout = new PassThrough();
+  proc.stderr = new PassThrough();
+  proc.pid = 0;
+  proc.killed = false;
+  proc.kill = () => {
+    proc.killed = true;
+  };
+
+  setTimeout(() => {
+    if (stderr) proc.stderr.write(stderr);
+    if (produce) fs.writeFileSync(path.join(tmpDir, produce), "media-bytes");
+    proc.stdout.end();
+    proc.stderr.end();
+    proc.emit("close", code);
+  }, delay);
+
+  return { proc, tmpDir, preferredExts: ["mp4"] };
+}
+
+test("runMediaJob retries the next attempt after a non-fatal failure", async () => {
+  const attempts = [
+    { selector: "first", note: "first" },
+    { selector: "second", note: "second" },
+  ];
+  let calls = 0;
+
+  const result = await runMediaJob({
+    attempts,
+    startJob: () => {
+      calls += 1;
+      if (calls === 1) {
+        return makeFakeJob({ code: 1, stderr: "ERROR: unable to download video data: HTTP Error 403: Forbidden" });
+      }
+      return makeFakeJob({ code: 0, produce: "media.mp4" });
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.attemptsUsed, 2);
+  assert.equal(calls, 2);
+  assert.ok(result.output.path.endsWith("media.mp4"));
+  cleanupJobDir(result.job.tmpDir);
+});
+
+test("runMediaJob stops immediately on fatal errors and keeps the 403 details for classification", async () => {
+  let calls = 0;
+  const fatal = await runMediaJob({
+    attempts: [{ selector: "a" }, { selector: "b" }],
+    startJob: () => {
+      calls += 1;
+      return makeFakeJob({ code: 1, stderr: "ERROR: Video unavailable" });
+    },
+  });
+  assert.equal(fatal.ok, false);
+  assert.equal(fatal.fatal, true);
+  assert.equal(calls, 1, "fatal errors must not burn the remaining attempts");
+
+  const blocked = await runMediaJob({
+    attempts: [{ selector: "a" }],
+    startJob: () => makeFakeJob({ code: 1, stderr: "ERROR: unable to download video data: HTTP Error 403: Forbidden" }),
+  });
+  assert.equal(blocked.ok, false);
+  assert.equal(classifyYtDlpError(blocked.stderr, blocked.code).status, 502);
+});
+
+test("runMediaJob reports abort when the signal fires", async () => {
+  const controller = new AbortController();
+  const promise = runMediaJob({
+    attempts: [{ selector: "a" }, { selector: "b" }],
+    startJob: () => makeFakeJob({ code: 0, produce: "media.mp4", delay: 50 }),
+    signal: controller.signal,
+  });
+
+  setTimeout(() => controller.abort(), 10);
+  const result = await promise;
+  assert.equal(result.aborted, true);
+});
+
+test("runMediaJob reports failure when every attempt runs out", async () => {
+  let calls = 0;
+  const result = await runMediaJob({
+    attempts: [{ selector: "a" }, { selector: "b" }],
+    startJob: () => {
+      calls += 1;
+      return makeFakeJob({ code: 1, stderr: "ERROR: unable to download video data: HTTP Error 403: Forbidden" });
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(calls, 2);
+  assert.match(String(result.stderr), /403/);
 });

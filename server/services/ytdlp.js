@@ -39,6 +39,12 @@ const YTDLP_JOB_FLAGS = [
   "--newline",
   "--progress-template",
   "download:GACDL %(progress._percent_str)s",
+  "--retries",
+  "5",
+  "--fragment-retries",
+  "10",
+  "--retry-sleep",
+  "fragment:1",
 ];
 
 // Video heights the UI offers, best first.
@@ -105,11 +111,16 @@ export function classifyYtDlpError(stderr, code) {
   if (lower.includes("unable to extract") || lower.includes("extraction failed")) {
     return { status: 502, message: "Failed to extract video information. YouTube may have changed its format or the video is restricted." };
   }
-  // HTTP 403 on media data: YouTube periodically blocks the media URLs of this
-  // network/session. HLS variants usually keep working; retrying after a short
-  // wait (or choosing another quality) is the reliable remedy.
+  // HTTP 403 on media data: YouTube periodically rejects the media URLs it
+  // handed out (bot checks / stale signatures / IP throttling). The download
+  // runner retries with fresh extraction and alternate sources before this
+  // final message is ever classified.
   if (lower.includes("http error 403") || lower.includes("unable to download video data") || lower.includes("forbidden")) {
-    return { status: 502, message: "YouTube temporarily blocked this download (HTTP 403). Wait a moment and try again, or pick another quality." };
+    return {
+      status: 502,
+      message:
+        "YouTube blocked this download (HTTP 403) even after retrying several sources. Wait a minute and try again — keeping yt-dlp up to date usually prevents this.",
+    };
   }
   if (lower.includes("network") || lower.includes("timeout") || lower.includes("http error 429")) {
     return { status: 502, message: "Network error while contacting YouTube. Please try again." };
@@ -350,6 +361,19 @@ export function buildVideoFormats(rawFormats, duration = null) {
 
     if (!plan) continue;
 
+    // Ordered yt-dlp selectors for this plan: preferred source first, then
+    // progressively safer fallbacks that the retry runner uses when YouTube
+    // rejects a source (HTTP 403, stale URL, format unavailable, ...).
+    const exactHls = `best[height=${height}][protocol*=m3u8]`;
+    const atMost = `best[height<=${height}][protocol*=m3u8]/best[height<=${height}]`;
+    let selectors;
+    if (plan.kind === "merge") {
+      const [vid, aid] = plan.formatIds;
+      selectors = [`${vid}+${aid}`, `${vid}+bestaudio[ext=m4a]/${vid}+bestaudio`, exactHls, atMost];
+    } else {
+      selectors = [plan.formatIds[0], exactHls, atMost];
+    }
+
     plans.push({
       height,
       label: `${height}p`,
@@ -358,6 +382,7 @@ export function buildVideoFormats(rawFormats, duration = null) {
       hasAudio: true,
       formatId: plan.formatIds.join("+"),
       ...plan,
+      selectors,
     });
   }
 
@@ -571,30 +596,121 @@ export function createJobOutputParser({ onProgress, onDetail } = {}) {
   };
 }
 
+/** Flags for `--extractor-args` (alternate YouTube players). */
+function extractorArgFlags(extractorArgs) {
+  const flags = [];
+  for (const arg of extractorArgs || []) {
+    if (arg) flags.push("--extractor-args", arg);
+  }
+  return flags;
+}
+
 /**
- * Build the yt-dlp `-f` selector for a video download.
- * `plan` comes from buildVideoFormats(); `height` and `formatId` are legacy
- * fallbacks from the query string.
+ * Build the ordered run plan (attempts) for a video download.
+ *
+ * Attempt 1 is the preferred source; the list then retries with fresh
+ * extraction (new media URLs), tries safer selectors, and finally falls back
+ * to alternate YouTube player clients, which expose different (often
+ * unblocked) media URLs.
  */
-function buildVideoSelector({ plan, height, formatId }) {
-  const suffix = height
-    ? `/best[height<=${height}][protocol*=m3u8]/best[height<=${height}]/best`
-    : "/best[protocol*=m3u8]/best";
+export function buildVideoAttempts({ plan = null, height = null, formatId = null } = {}) {
+  const attempts = [];
+  const seen = new Set();
+  const add = (selector, options = {}) => {
+    if (!selector) return;
+    const key = `${selector}|${(options.extractorArgs || []).join(",")}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    attempts.push({ selector, ...options });
+  };
 
-  if (plan?.formatIds?.length) {
-    const [videoId, audioId] = plan.formatIds;
-    if (plan.kind === "merge" && audioId) {
-      return `${videoId}+${audioId}/${videoId}+bestaudio[ext=m4a]/${videoId}+bestaudio/${videoId}${suffix}`;
-    }
-    return `${videoId}${suffix}`;
+  const h = height && Number.isFinite(height) ? height : 1080;
+
+  if (plan?.selectors?.length) {
+    for (const selector of plan.selectors) add(selector, { note: "Starting download…" });
+  } else if (formatId) {
+    // Legacy callers pass a raw yt-dlp format id.
+    add(`${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio/${formatId}`, { note: "Starting download…" });
+    add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]`, { note: "Trying an alternative source…" });
+  } else {
+    add(`bestvideo[height<=${h}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}][protocol*=m3u8]/best[height<=${h}]`, {
+      note: "Starting download…",
+    });
   }
 
-  if (formatId) {
-    return `${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio/${formatId}${suffix}`;
+  // Retry the preferred source once with a fresh extraction before falling
+  // back: media URLs are time-limited, so a new one often just works.
+  if (attempts.length > 0) {
+    attempts.splice(1, 0, { ...attempts[0], note: "Source was blocked — retrying with fresh links…", delayMs: 1200 });
   }
 
-  // No explicit selection: best available up to 1080p, HLS first.
-  return `bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080][protocol*=m3u8]/best[height<=1080]/best`;
+  // Last resorts: alternate player clients. web_safari exposes the HLS ladder
+  // and tv/mweb expose progressive formats — different URL sets than default.
+  add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]/best`, {
+    extractorArgs: ["youtube:player_client=web_safari"],
+    note: "Trying an alternate YouTube player…",
+    delayMs: 800,
+  });
+  add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]/best`, {
+    extractorArgs: ["youtube:player_client=tv"],
+    note: "Trying an alternate YouTube player…",
+    delayMs: 800,
+  });
+
+  return attempts.slice(0, 7);
+}
+
+/**
+ * Build the ordered run plan (attempts) for an audio download.
+ * Small muxed HLS variants are the last resort: `-x` extracts their audio.
+ */
+export function buildAudioAttempts({ sourceFormatId = null } = {}) {
+  const ladder = sourceFormatId ? `${sourceFormatId}/${AUDIO_SOURCE_LADDER}` : AUDIO_SOURCE_LADDER;
+  return [
+    { selector: ladder, note: "Starting audio download…" },
+    { selector: ladder, note: "Source was blocked — retrying with fresh links…", delayMs: 1200 },
+    { selector: "bestaudio[ext=m4a]/bestaudio/best[height<=144]/best", note: "Trying an alternative audio source…", delayMs: 600 },
+    {
+      selector: "best[height<=144]/best[height<=240]/best",
+      extractorArgs: ["youtube:player_client=web_safari"],
+      note: "Trying an alternate YouTube player…",
+      delayMs: 600,
+    },
+    {
+      selector: "best[height<=144]/best[height<=240]/best",
+      extractorArgs: ["youtube:player_client=tv"],
+      note: "Trying an alternate YouTube player…",
+      delayMs: 600,
+    },
+  ];
+}
+
+/**
+ * True when retrying cannot help (the video itself is unavailable, private,
+ * age-restricted, region-blocked, live, ...).
+ * A blocked media URL (403) is explicitly NOT fatal — the runner retries it.
+ */
+export function isFatalDownloadError(stderr) {
+  const s = String(stderr || "").toLowerCase();
+  if (!s) return false;
+  return (
+    s.includes("video unavailable") ||
+    s.includes("this video is unavailable") ||
+    s.includes("private video") ||
+    s.includes("members-only") ||
+    s.includes("members only") ||
+    s.includes("join this channel") ||
+    s.includes("requires authentication") ||
+    s.includes("confirm your age") ||
+    s.includes("login required") ||
+    s.includes("not available in your country") ||
+    s.includes("not available in this country") ||
+    s.includes("blocked in your country") ||
+    s.includes("made this video unavailable") ||
+    s.includes("this live event") ||
+    s.includes("premiere will begin") ||
+    s.includes("unsupported url")
+  );
 }
 
 /**
@@ -602,27 +718,30 @@ function buildVideoSelector({ plan, height, formatId }) {
  * yt-dlp writes the finished file into a temp dir; the caller streams it.
  */
 export function startVideoDownload(rawUrl, options = {}) {
-  const { plan = null, formatId = null, height = null } = options;
+  const { selector, extractorArgs = null } = options;
 
   if (!isYouTubeUrl(rawUrl)) {
     const err = new Error("Invalid YouTube URL");
     err.status = 400;
     throw err;
   }
+  if (!selector || typeof selector !== "string") {
+    const err = new Error("Missing download selector");
+    err.status = 500;
+    throw err;
+  }
   const url = normalizeYouTubeUrl(rawUrl);
-  const selector = buildVideoSelector({ plan, height, formatId });
   const tmpDir = makeJobDir();
 
   const args = [
     ...YTDLP_JOB_FLAGS,
+    ...extractorArgFlags(extractorArgs),
     "-f",
     selector,
     "--merge-output-format",
     "mp4",
     "--socket-timeout",
     "20",
-    "--retries",
-    "3",
     "-o",
     path.join(tmpDir, "media.%(ext)s"),
     url,
@@ -637,11 +756,16 @@ export function startVideoDownload(rawUrl, options = {}) {
  * (-x --audio-format), which produces correct containers/extradata.
  */
 export function startAudioDownload(rawUrl, options = {}) {
-  const { format = "m4a", quality = null, sourceFormatId = null } = options;
+  const { format = "m4a", quality = null, selector, extractorArgs = null } = options;
 
   if (!isYouTubeUrl(rawUrl)) {
     const err = new Error("Invalid YouTube URL");
     err.status = 400;
+    throw err;
+  }
+  if (!selector || typeof selector !== "string") {
+    const err = new Error("Missing download selector");
+    err.status = 500;
     throw err;
   }
   const url = normalizeYouTubeUrl(rawUrl);
@@ -667,11 +791,11 @@ export function startAudioDownload(rawUrl, options = {}) {
     mp3Quality = q;
   }
 
-  const selector = sourceFormatId ? `${sourceFormatId}/${AUDIO_SOURCE_LADDER}` : AUDIO_SOURCE_LADDER;
   const tmpDir = makeJobDir();
 
   const args = [
     ...YTDLP_JOB_FLAGS,
+    ...extractorArgFlags(extractorArgs),
     "-f",
     selector,
     "-x",
@@ -679,13 +803,159 @@ export function startAudioDownload(rawUrl, options = {}) {
     audioFormat,
     "--socket-timeout",
     "20",
-    "--retries",
-    "3",
   ];
   if (mp3Quality) args.push("--audio-quality", `${mp3Quality}K`);
   args.push("-o", path.join(tmpDir, "audio.%(ext)s"), url);
 
   return { proc: spawnJob(args), tmpDir, selector, outputExt: audioFormat, preferredExts: [audioFormat] };
+}
+
+/**
+ * Run a media job with ordered fallback attempts.
+ *
+ * `startJob(attempt)` must return `{ proc, tmpDir, preferredExts }`.
+ * Attempts are tried in order until one produces a media file. Non-fatal
+ * failures move on to the next attempt; fatal ones (video unavailable, ...)
+ * stop immediately. Returns:
+ *   { ok: true, output, job, attemptsUsed }
+ *   { ok: false, aborted: true }
+ *   { ok: false, stderr, code, fatal }
+ */
+export function runMediaJob({ attempts, startJob, onProgress, onDetail, signal }) {
+  return new Promise((resolve) => {
+    const total = attempts.length;
+    let index = 0;
+    let currentJob = null;
+    let cancelled = false;
+    let lastStderr = "";
+    let block403Stderr = "";
+    let lastCode = null;
+
+    const finish = (result) => resolve(result);
+
+    const onAbort = () => {
+      cancelled = true;
+      if (currentJob) killProcessTree(currentJob.proc);
+    };
+    if (signal) {
+      if (signal.aborted) return finish({ ok: false, aborted: true });
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    const next = () => {
+      if (cancelled) return finish({ ok: false, aborted: true });
+      if (index >= total) {
+        return finish({ ok: false, stderr: block403Stderr || lastStderr, code: lastCode });
+      }
+
+      const attempt = attempts[index];
+      const attemptNumber = index + 1;
+      index += 1;
+
+      if (onDetail) {
+        if (attemptNumber === 1) onDetail(attempt.note || "Starting download…");
+        else onDetail(`${attempt.note || "Trying another source…"} (attempt ${attemptNumber}/${total})`);
+      }
+
+      const run = () => {
+        if (cancelled) return finish({ ok: false, aborted: true });
+
+        let job;
+        try {
+          job = startJob(attempt);
+        } catch (e) {
+          lastStderr = e.message || String(e);
+          return next();
+        }
+        currentJob = job;
+
+        let attemptStderr = "";
+        const parse = createJobOutputParser({
+          onProgress: (pct) => onProgress && onProgress(pct, attemptNumber, total),
+          onDetail,
+        });
+
+        job.proc.stdout.on("data", parse);
+        job.proc.stdout.on("error", () => {});
+        job.proc.stderr.on("error", () => {});
+        job.proc.stderr.on("data", (chunk) => {
+          attemptStderr += chunk.toString("utf-8");
+          if (attemptStderr.length > 8192) attemptStderr = attemptStderr.slice(-8192);
+        });
+
+        // A spawn failure emits BOTH "error" and "close"; guard so one
+        // attempt settles exactly once (otherwise attempts get skipped).
+        let attemptDone = false;
+        const settleAttempt = (fn) => {
+          if (attemptDone) return;
+          attemptDone = true;
+          currentJob = null;
+          fn();
+        };
+
+        job.proc.on("error", (err) => {
+          settleAttempt(() => {
+            lastStderr = err.message || String(err);
+            cleanupJobDir(job.tmpDir);
+            next();
+          });
+        });
+
+        job.proc.on("close", (code) => {
+          settleAttempt(() => {
+            if (cancelled) {
+              cleanupJobDir(job.tmpDir);
+              return finish({ ok: false, aborted: true });
+            }
+
+            lastCode = code;
+            if (attemptStderr) {
+              lastStderr = attemptStderr;
+              if (/403|forbidden/i.test(attemptStderr)) block403Stderr = attemptStderr;
+            }
+
+            if (code === 0) {
+              const output = findOutputFile(job.tmpDir, job.preferredExts);
+              if (output) {
+                return finish({ ok: true, output, job, attemptsUsed: attemptNumber });
+              }
+              lastStderr = lastStderr || "Download completed but no media file was produced.";
+              cleanupJobDir(job.tmpDir);
+              return next();
+            }
+
+            if (isFatalDownloadError(attemptStderr)) {
+              cleanupJobDir(job.tmpDir);
+              return finish({ ok: false, stderr: attemptStderr, code, fatal: true });
+            }
+
+            console.log(`[ytdlp] attempt ${attemptNumber}/${total} failed (exit ${code}); trying next source`);
+            cleanupJobDir(job.tmpDir);
+            next();
+          });
+        });
+      };
+
+      const delayMs = attempt.delayMs || 0;
+      if (delayMs > 0) setTimeout(run, delayMs);
+      else run();
+    };
+
+    next();
+  });
+}
+
+/**
+ * yt-dlp version, resolved once and cached (diagnostics / health endpoint).
+ */
+let versionPromise = null;
+export function getYtDlpVersion() {
+  if (!versionPromise) {
+    versionPromise = execYtDlp(["--version"], 15000)
+      .then((result) => result.stdout.trim())
+      .catch(() => null);
+  }
+  return versionPromise;
 }
 
 /**

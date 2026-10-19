@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { validateInfoRequest } from "../utils/validation.js";
 import { getVideoInfo } from "../services/ytdlp.js";
+import { getVideoInfoCached } from "../utils/infoCache.js";
 
 const router = Router();
 
@@ -12,7 +13,9 @@ router.post("/", async (req, res) => {
   }
 
   try {
-    const info = await getVideoInfo(validation.normalizedUrl);
+    // Cached so the download click that follows does not pay for a second
+    // extraction round trip.
+    const info = await getVideoInfoCached(validation.normalizedUrl, () => getVideoInfo(validation.normalizedUrl));
 
     // Return expanded fields (optional fields may be null, but do not fail)
     return res.json({

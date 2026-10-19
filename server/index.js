@@ -9,6 +9,7 @@ import downloadRouter from "./routes/download.js";
 import intelligenceRouter from "./routes/intelligence.js";
 import audioRouter from "./routes/audio.js";
 import { getActiveDownloads } from "./utils/downloadStatus.js";
+import { getYtDlpVersion } from "./services/ytdlp.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,8 +34,11 @@ app.use((req, res, next) => {
 });
 
 // Health
-app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", ytDlp: process.env.YTDLP_BIN || "yt-dlp" });
+// ytDlpVersion is informational: keep yt-dlp up to date (see AGENTS.md),
+// stale versions get their media URLs rejected by YouTube (HTTP 403).
+app.get("/api/health", async (req, res) => {
+  const version = await getYtDlpVersion();
+  res.json({ status: "ok", ytDlp: process.env.YTDLP_BIN || "yt-dlp", ytDlpVersion: version });
 });
 
 // Active downloads status
@@ -70,7 +74,8 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error." });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Grab a Clip server running at http://localhost:${PORT}`);
-  console.log(`yt-dlp binary: ${process.env.YTDLP_BIN || "yt-dlp"}`);
+  const version = await getYtDlpVersion();
+  console.log(`yt-dlp binary: ${process.env.YTDLP_BIN || "yt-dlp"}${version ? ` (version ${version})` : " (version unknown)"}`);
 });
