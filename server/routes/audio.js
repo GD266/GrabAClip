@@ -13,6 +13,7 @@ import {
   AUDIO_MP3_QUALITIES,
 } from "../services/ytdlp.js";
 import { getVideoInfoCached } from "../utils/infoCache.js";
+import { recordError } from "../utils/errorLog.js";
 import { startDownload, setPhase, setProgressDetail, completeDownload, failDownload, isActive, removeDownload } from "../utils/downloadStatus.js";
 
 const router = Router();
@@ -82,6 +83,7 @@ router.get("/", async (req, res) => {
     const status = e.status || 500;
     const message = e.message || "Failed to retrieve video information.";
     console.error(`[audio] info fetch failed for ${normalizedUrl}:`, e.original || e.message);
+    recordError("audio:info", e.original ? new Error(`${message} :: ${e.original}`) : e);
     failDownload("audio", normalizedUrl, message);
     return res.status(status).json({ error: message });
   } finally {
@@ -155,6 +157,7 @@ router.get("/", async (req, res) => {
     const stderr = result.stderr || "";
     console.error(`[audio] all ${attempts.length} attempts failed (exit ${result.code}):`, stderr.slice(0, 500));
     const classified = classifyYtDlpError(stderr, result.code);
+    recordError("audio", new Error(`${classified.message} :: ${stderr.slice(0, 400)}`));
     failDownload("audio", normalizedUrl, classified.message);
     if (!res.headersSent && !res.writableEnded) {
       res.status(classified.status).json({ error: classified.message, details: stderr.slice(0, 300) });

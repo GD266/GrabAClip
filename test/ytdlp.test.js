@@ -274,6 +274,12 @@ test("classifyYtDlpError maps unavailable/private/age-restricted videos", () => 
   assert.equal(classifyYtDlpError("ERROR: Sign in to confirm your age", 1).status, 403);
 });
 
+test("classifyYtDlpError maps the datacenter-IP bot check to 502", () => {
+  const r = classifyYtDlpError("ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies for the authentication.", 1);
+  assert.equal(r.status, 502);
+  assert.match(r.message, /verify it isn't a bot/i);
+});
+
 test("classifyYtDlpError maps format errors to 400 and unknown errors to 500", () => {
   assert.equal(classifyYtDlpError("ERROR: Requested format is not available", 1).status, 400);
   assert.equal(classifyYtDlpError("ERROR: something totally unexpected", 1).status, 500);

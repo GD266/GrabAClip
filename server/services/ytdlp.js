@@ -122,6 +122,11 @@ export function classifyYtDlpError(stderr, code) {
   if (lower.includes("private video")) {
     return { status: 403, message: "This video is private and cannot be downloaded." };
   }
+  // Datacenter-IP bot check ("Sign in to confirm you're not a bot"). The info
+  // fetcher retries alternate player clients before this surfaces.
+  if (lower.includes("confirm you're not a bot") || lower.includes("confirm you’re not a bot") || lower.includes("sign in to confirm")) {
+    return { status: 502, message: "YouTube is asking this server to verify it isn't a bot. Please try again in a moment." };
+  }
   // Age-restricted / authentication required — must be checked before generic 403
   if (
     lower.includes("confirm your age") ||
@@ -563,26 +568,42 @@ export async function getVideoInfo(rawUrl, options = {}) {
 
   const url = normalizeYouTubeUrl(rawUrl);
 
-  const args = [
+  const baseArgs = [
     ...YTDLP_QUIET_FLAGS,
     "--dump-json",
     "--socket-timeout",
     "15",
     "--retries",
     "1",
-    url,
   ];
 
-  let result;
-  try {
-    result = await execYtDlp(args, INFO_TIMEOUT_MS, signal);
-  } catch (e) {
-    if (e.code === "ABORTED" || e.status === 499) throw e;
-    if (e.status) throw e;
-    const classified = classifyYtDlpError(e.stderr || e.message, e.code);
+  // Try the default extraction first. If YouTube answers with a datacenter-IP
+  // bot check (or another player-specific error), retry with the alternate
+  // player clients the download retry chain uses. Genuinely unavailable
+  // videos fail fatally and are not retried.
+  let result = null;
+  let lastError = null;
+  for (const playerClient of [null, "web_safari", "tv"]) {
+    const args = [...baseArgs];
+    if (playerClient) args.push("--extractor-args", `youtube:player_client=${playerClient}`);
+    args.push(url);
+    try {
+      result = await execYtDlp(args, INFO_TIMEOUT_MS, signal);
+      break;
+    } catch (e) {
+      if (e.code === "ABORTED" || e.status === 499) throw e;
+      if (e.status) throw e;
+      lastError = e;
+      if (isFatalDownloadError(e.stderr || e.message)) break;
+    }
+  }
+
+  if (!result) {
+    const stderr = lastError?.stderr || lastError?.message || "";
+    const classified = classifyYtDlpError(stderr, lastError?.code);
     const err = new Error(classified.message);
     err.status = classified.status;
-    err.original = e.stderr || e.message;
+    err.original = stderr;
     throw err;
   }
 

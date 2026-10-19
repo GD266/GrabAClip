@@ -2,6 +2,7 @@ import { Router } from "express";
 import { validateInfoRequest } from "../utils/validation.js";
 import { getVideoInfo } from "../services/ytdlp.js";
 import { getVideoInfoCached } from "../utils/infoCache.js";
+import { recordError } from "../utils/errorLog.js";
 
 const router = Router();
 
@@ -45,6 +46,7 @@ router.post("/", async (req, res) => {
     // Do not expose stack / internal details
     // Log server side
     console.error(`[info] error for ${validation.normalizedUrl}:`, e.original || e.message);
+    recordError("info", e.original ? new Error(`${message} :: ${e.original}`) : e);
 
     return res.status(status).json({ error: message });
   }
