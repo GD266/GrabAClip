@@ -1,43 +1,42 @@
 # AGENTS.md
 
-Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader backend (`server/`) + vanilla JS frontend (`public/`). No build step, no bundler, not a monorepo.
+Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader backend (`server/`) + vanilla JS frontend (`public/`). No local build or bundler step (Vercel only runs `scripts/vercel-build.js`); not a monorepo.
 
 ## Commands
 
 - `npm run dev` — server with reload (`node --watch server/index.js`) at http://localhost:3000
 - `npm start` — run server
-- `npm test` — `node --test test/*.test.js`; pure unit tests (validator, format planner, progress parser, error classifier, download status, transcript normalizer). No network required.
+- `npm test` — `node --test test/*.test.js`; network-free unit tests (validator, format planner/attempts, progress parser, error classifier, download status, info cache, transcript normalizer, cookies, deployment layout).
 - Single test: `node --test test/<file>.test.js`; filter: `node --test --test-name-pattern="name" test/<file>.test.js`
 - No lint / format / typecheck / CI is configured — do not invent commands. Syntax check: `node --check <file>`.
-- Smoke test: `npm start`, then `GET http://localhost:3000/api/health` → `{ status: "ok", ytDlp: <configured name>, ytDlpVersion: <version|null> }` (it only reports settings/version; it does not check that the binary path exists).
+- Smoke test: `npm start`, then `GET http://localhost:3000/api/health` → `{ status: "ok", ytDlp: <configured name>, ytDlpVersion: <version|null> }` (it reports settings/version only; it does not check that the binary path exists).
 
 ## Runtime prerequisites
 
-- `yt-dlp` on PATH (override: `YTDLP_BIN`) — required for all API features. `YTDLP_BIN` is read at module import in `ytdlp.js`/`transcript.js` (set it before importing in tests); `FFMPEG_BIN` is read per call.
+- `yt-dlp` on PATH (override: `YTDLP_BIN`) — required for all API features. `YTDLP_BIN` and `YTDLP_COOKIES_*` are resolved at module import, so tests that change them must set env before a dynamic `import()` (see `test/cookies.test.js`); `FFMPEG_BIN`/`FFPROBE_BIN` are read per call.
 - **Keep yt-dlp current** (`python -m pip install -U yt-dlp`, or `yt-dlp -U` for standalone builds). Verified 2026-10-19: yt-dlp **2026.07.04 was rejected by YouTube with HTTP 403 on every DASH media URL**; installing 2026.08.19 fixed it with no app change. `/api/health` and the startup log report the version — a stale yt-dlp is the first thing to check when downloads start failing.
-- `ffmpeg` on PATH (override: `FFMPEG_BIN`) — required for every audio download (`-x --audio-format …`) and for merging MP4 video. Both overrides are documented in `.env.example` (a missing `.env` is fine; defaults are the bare binary names).
+- `ffmpeg` on PATH (override: `FFMPEG_BIN`) — required for every audio download (`-x --audio-format …`) and for merging MP4 video. `FFMPEG_BIN`/`FFPROBE_BIN` are only used by the app's own merge/audio check; yt-dlp still resolves ffmpeg from PATH (no `--ffmpeg-location` is passed). A missing ffprobe only skips the audio-stream check. `YTDLP_BIN`/`FFMPEG_BIN` are documented in `.env.example` (a missing `.env` is fine; defaults are the bare binary names).
 - Copy `.env.example` → `.env`. Without `OPENAI_API_KEY`/`AI_API_KEY`, the AI provider silently falls back to `MockProvider` (intelligence responses flagged `isFallback: true`) — `server/services/ai/factory.js`.
-- yt-dlp runs with `--remote-components ejs:github`; JS challenges resolve via **deno** (`[jsc:deno]` in logs) — a soft runtime dependency.
-- Datacenter hosts (Render/Railway/Fly/VPS) get YouTube's "Sign in to confirm you're not a bot" challenge on some videos while others work. Set `YTDLP_COOKIES_B64` (base64 of a Netscape `cookies.txt`) or `YTDLP_COOKIES_FILE` to pass `--cookies` to every yt-dlp call; `getVideoInfo` also retries the `web_safari`/`tv` player clients first. Cookies are a host env var, not part of the image (see `DEPLOY.md`).
+- yt-dlp runs with `--remote-components ejs:github`; JS challenges resolve via **deno** on PATH (`[jsc:deno]` in logs; `DENO_BIN` only affects diagnostics) — a soft runtime dependency.
+- Datacenter hosts (Render/Railway/Fly/VPS) get YouTube's "Sign in to confirm you're not a bot" challenge on some videos while others work. Set `YTDLP_COOKIES_B64` (base64 of a Netscape `cookies.txt`) or `YTDLP_COOKIES_FILE` (file wins if both are set) to pass `--cookies` to every info/download call (the transcript fetcher does not use cookies); `getVideoInfo` also retries the default → `web_safari` → `web_embedded` → `tv` player clients first. Cookies are a host env var, not part of the image (see `DEPLOY.md`).
 
 ## Layout
 
 - `server/index.js` — entrypoint; mounts `/api/*`, serves `public/` statically (including `/shared/validator.js`), SPA fallback for other paths (Express **4** syntax `app.get("*")`). CORS is open by default or restricted with `CORS_ORIGIN`.
 - Endpoints: POST `/api/info`, POST `/api/intelligence`, GET `/api/download` (video), GET `/api/download/audio`, GET `/api/downloads/status`, GET `/api/health`.
-- `server/routes/` — HTTP layer; `server/services/` — yt-dlp jobs, transcript, AI logic; `server/utils/` — validation + download status; `test/` — `node:test` unit tests.
+- `server/routes/` — HTTP layer; `server/services/` — yt-dlp jobs, transcript, AI logic; `server/utils/` — validation, info cache, download status, error log; `test/` — `node:test` unit tests.
 - `public/shared/validator.js` — canonical URL validation. It lives under `public/` so the browser can import it as `/shared/validator.js` from both Express (local) and static hosts (Vercel); `server/utils/validation.js` imports the same file.
 
-## How downloads work (rewritten 2026-10-19)
+## How downloads work
 
 1. `GET /api/download?url=…&height=720` (legacy `formatId=` still accepted) resolves a per-height **plan** (`buildVideoFormats` in `server/services/ytdlp.js`) and starts a yt-dlp job for video **with audio**.
    - **Two plan sets come from one extraction**: `formats` is size-optimised (AV1 > VP9 > H.264, lowest-bitrate variant per height; roughly half the size) and `formatsCompatible` keeps H.264 for older players. The UI's “Smaller file” toggle (checked by default) swaps the sets; `&codec=h264` on the download URL selects the compatibility set.
    - Plan preference per height: size mode → merge an AV1/VP9 source first; compatibility mode → muxed **HLS** variant → **merge** (DASH/HLS video-only + best m4a audio) → progressive (last resort). Plans carry `videoSize`/`audioSize` estimates (used for progress weighting and the UI size hints).
    - **Audio is mandatory**: every selector chain ends with an explicit video+audio merge, the legacy `formatId` path never falls back to the bare video-only id, and `runMediaJob({ requireAudio: true })` runs `ffprobe` on the finished file. A silent file is rejected and the next source is tried.
-   - Every plan carries an ordered `selectors` list; `buildVideoAttempts` turns it into a fallback chain: preferred source → fresh retry (new media URLs) → safer selectors → alternate YouTube players (`youtube:player_client=web_safari` / `tv`). `buildAudioAttempts` does the same for audio (HLS ladder → audio-only → smallest muxed variant via alternate players).
+   - Every plan carries an ordered `selectors` list; `buildVideoAttempts` turns it into a fallback chain (capped at 9 attempts): preferred source → fresh retry (new media URLs) → safer selectors → alternate YouTube players (`youtube:player_client=web_safari` / `web_embedded` / `tv`). `buildAudioAttempts` does the same for audio (HLS ladder → audio-only → smallest muxed variant via alternate players).
    - `runMediaJob` executes the chain: non-fatal failures (403, network, missing format, no output file) move to the next attempt; `isFatalDownloadError` (unavailable/private/age/region/live) stops immediately. Abort (client disconnect) kills the running process tree.
    - **Merge plans download video and audio concurrently** (`startMergeDownload`): two yt-dlp processes, then `ffmpeg -c copy -movflags +faststart`. yt-dlp's own merge downloads the streams sequentially; concurrent streams win on connections where YouTube throttles each connection separately. It is bandwidth-neutral on connections with a hard aggregate cap.
-   - **Memory-constrained hosts** (container limit ≤ 1.5 GB, e.g. Render free = 512 MB) skip the two-process merge entirely: `SEQUENTIAL_MERGE` is on, so the plan's combined `video+audio` selector runs in a single yt-dlp process (it downloads video then audio and merges internally), and `--concurrent-fragments` drops from 8 to 2. Two yt-dlp + Deno runtimes at once get the container OOM-killed mid-job. Overrides: `GAC_LOW_MEMORY=1|0`, `GAC_SEQUENTIAL_MERGE=1|0`, `GAC_CONCURRENT_FRAGMENTS=n`.
-   - Jobs use `--concurrent-fragments 8` (2 on memory-constrained hosts), so HLS/DASH fragments download in parallel.
+   - **Memory-constrained hosts** (container limit ≤ 1.5 GB, e.g. Render free = 512 MB) skip the two-process merge entirely: `SEQUENTIAL_MERGE` is on, so the plan's combined `video+audio` selector runs in a single yt-dlp process (it downloads video then audio and merges internally), and `--concurrent-fragments` drops from 8 to 2. Two yt-dlp + Deno runtimes at once get the container OOM-killed mid-job. Overrides: `GAC_LOW_MEMORY=1|0`, `GAC_SEQUENTIAL_MERGE=1|0`, `GAC_CONCURRENT_FRAGMENTS=n`. Jobs otherwise use `--concurrent-fragments 8`, so HLS/DASH fragments download in parallel.
    - Heights are capped at 1080p (UI list: 1080/720/480/360/240/144).
 2. `GET /api/download/audio?url=…&format=m4a|mp3|wav|opus&quality=320|192|128` starts an audio-only job; UI offers M4A / MP3 320/192/128 / WAV. Source: HLS ladder `93/94/95/96/92/91` (AAC-LC 128k preferred over HE-AAC), falling back to `bestaudio`. `best`/`high`/`aac` are aliases for `m4a`.
 3. Jobs are **file based**: yt-dlp writes into a temp dir (`os.tmpdir()/grabaclip/job-*`, deleted afterwards) so it can run its own postprocessing — TS→MP4 fixup for HLS, `--merge-output-format mp4`, `-x --audio-format …` via ffmpeg. Piping to stdout is what used to produce MPEG-TS files named `.mp4` and extradata-less M4A — do not go back to piping.
@@ -49,12 +48,12 @@ Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader bac
 ## Gotchas
 
 - Services signal HTTP status via an `err.status` property; routes respond `e.status || 500`. New service errors without `.status` surface as generic 500s.
-- Media-data 403s are YouTube-side (bot/IP checks / stale extraction); the retry chain exists for them — a **stale yt-dlp is the most common root cause** (see Runtime prerequisites). `classifyYtDlpError` maps a final failure to 502. Compare against a plain yt-dlp run before blaming app code.
+- Media-data 403s are YouTube-side (bot/IP checks / stale extraction); the retry chain exists for them — a **stale yt-dlp is the most common root cause** (see Runtime prerequisites). Compare against a plain yt-dlp run before blaming app code.
 - Download status (`server/utils/downloadStatus.js`) is an in-memory Map — lost on restart; duplicate downloads for the same video+type return 429 while a job runs. Entries linger (complete/failed) for up to 10 min (`cleanupStale`).
 - Cancelling: a client disconnect kills the yt-dlp process tree with `taskkill /T /F` — **Windows only** in practice: `spawn` is not `detached`, so the POSIX `kill(-pid)` branch degrades to killing just the direct child.
-- `cleanupJobDir` retries (3×, 250 ms) because Windows keeps the media file locked briefly after the process exits.
-- `classifyYtDlpError` (`server/services/ytdlp.js`) is the **single** source of friendly error strings — routes call it, they do not re-implement matching. Covered by `test/ytdlp.test.js`.
-- Timeouts: info 30s, transcript 30s, download jobs 20 min (`DOWNLOAD_TIMEOUT_MS` in `ytdlp.js` / `transcript.js`).
+- `cleanupJobDir` retries a few times (250 ms apart) because Windows keeps the media file locked briefly after the process exits.
+- `classifyYtDlpError` (`server/services/ytdlp.js`) is the **single** source of friendly error strings — routes call it, they do not re-implement matching. It returns 4xx/502/504; the generic fallback is 500. Covered by `test/ytdlp.test.js`.
+- Timeouts: info/transcript 30s, download jobs 20 min, local ffmpeg merge 5 min (`DOWNLOAD_TIMEOUT_MS` in `ytdlp.js` / `transcript.js`).
 - `.env` and media artifacts (`*.mp4`, `*.part`, `*.vtt`, `*.srt`) are gitignored — never commit them. Commits use conventional style (`feat: ...`, `fix: ...`).
 
 ## Deployment (Vercel + backend)
@@ -62,18 +61,17 @@ Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader bac
 - **Vercel can only host the static frontend.** `yt-dlp`/`ffmpeg` are native binaries and jobs are long-running/large, so Vercel Functions cannot run the API. Deploy the backend with the included `Dockerfile` (Render/Railway/Fly/VPS) and point the frontend at it.
 - `vercel.json` sets `outputDirectory: "public"` and runs `scripts/vercel-build.js`. Set `GAC_API_BASE` in the Vercel project (no trailing slash, no `/api`) to write the backend URL into `public/config.js`; if unset, the committed `public/config.js` is kept. Locally the value is empty and API calls are same-origin.
 - The `Dockerfile` installs yt-dlp from PyPI, copies Deno from `denoland/deno:bin`, and runs `yt-dlp --version` / `deno --version` / `ffmpeg -version` at build time, so a broken image fails the deploy instead of serving 500s.
-- `GET /api/health?diagnostics=1` returns resolved paths, exit codes and stderr for yt-dlp/ffmpeg/deno, plus the container memory limit, `lowMemoryHost`/`sequentialMerge`/`concurrentFragments`, `uptimeSeconds` (a small value means the process restarted) and the last `recentErrors` (unhandled rejections/exceptions are recorded instead of killing the process). Use it when a deployed backend returns "Failed to retrieve video information" (a null `ytDlpVersion` in `/api/health` means yt-dlp is not runnable in the container).
+- `GET /api/health?diagnostics=1` returns resolved paths, exit codes and stderr for yt-dlp/ffmpeg/deno, cookie status, the container memory limit, `lowMemoryHost`/`sequentialMerge`/`concurrentFragments`, `uptimeSeconds` (a small value means the process restarted) and the last `recentErrors` (unhandled rejections/exceptions are recorded instead of killing the process). Use it when a deployed backend returns "Failed to retrieve video information" (a null `ytDlpVersion` in `/api/health` means yt-dlp is not runnable in the container).
 - `public/index.html` loads `/config.js` before the `app.js` module; `public/app.js` routes every API call through `apiUrl()`.
 - The backend exposes `Content-Disposition`/`Content-Length` through CORS. `CORS_ORIGIN` (comma-separated) restricts origins; the default is `*`.
 - Full steps and host notes: `DEPLOY.md`.
 
 ## Known issues (verified 2026-10-19)
 
-- Download speed is bounded by YouTube/network throughput: this machine measured ~0.5–0.8 MB/s aggregate, so a 40-minute video is ~60–90 MB (144p) and takes minutes regardless of app-side tuning. `--concurrent-fragments` helps single-connection throttling; parallel video+audio helps per-connection throttling.
+- Download speed is bounded by YouTube/network throughput (this machine measured ~0.5–0.8 MB/s aggregate): a 40-minute video is ~60–90 MB at 144p and takes minutes regardless of app-side tuning. `--concurrent-fragments` helps single-connection throttling; parallel video+audio helps per-connection throttling, not a hard aggregate cap.
 - A first `/api/info` still runs a full extraction (~7 s here); only follow-up calls within the 10 min TTL are instant. Rapid repeated *uncached* `/api/info` calls get throttled and can 504 at the 30s info timeout — cool down before treating as a regression.
-- Failed attempts each pay their own extraction cost (a few seconds), so a fully-blocked download can spend ~30-40 s trying 5-7 sources before reporting 502.
-- The default “Smaller file” plans use AV1 (MP4) or VP9 (in MP4) sources. They play in current browsers, VLC and modern Windows players; very old players may need the H.264 option (uncheck the toggle).
-- Transcripts: `--sub-langs en` only; the any-language fallback exists only as comments; `isAuto` is hardcoded `true` (`server/services/transcript.js`).
+- Failed attempts each pay their own extraction cost (a few seconds plus short backoff delays), so a fully-blocked download can spend ~30-40 s trying up to 9 sources before reporting 502.
+- Transcripts: `--sub-langs en` only; the any-language fallback exists only as comments; `isAuto` is hardcoded `true` (`server/services/transcript.js`), and transcript yt-dlp calls do not pass configured cookies.
 - Large downloads are written to disk twice (YouTube → temp file, temp file → client); an aborted job may briefly leave a `grabaclip/job-*` dir behind until cleanup retries.
 - No rate limiting anywhere; the server proxies YouTube fetches for any client — required before public deploy.
 - The frontend buffers the whole file in memory (blob) before saving, so very large 1080p downloads cost RAM on the client.

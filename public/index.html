@@ -97,7 +97,13 @@
               </dl>
 
               <details class="desc-details">
-                <summary>Description</summary>
+                <summary>
+                  <span>Description</span>
+                  <span class="desc-toggle" aria-hidden="true">
+                    <span class="desc-toggle-open">Show more</span>
+                    <span class="desc-toggle-close">Show less</span>
+                  </span>
+                </summary>
                 <div id="vDescription" class="desc-body"></div>
               </details>
             </div>
@@ -105,7 +111,11 @@
         </section>
 
         <!-- Download tabs -->
-        <section class="card card-downloads">
+        <section class="card card-downloads" aria-labelledby="downloadsTitle">
+          <div class="downloads-head">
+            <h2 id="downloadsTitle" class="downloads-title">Download options</h2>
+            <span class="downloads-kicker">Choose a format</span>
+          </div>
           <div class="tabbar" role="tablist" aria-label="Download options">
             <button id="tabVideo" class="tab is-active" role="tab" aria-selected="true" aria-controls="panelVideo">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="3"/><path d="M10 9.5 15 12l-5 2.5v-5Z"/></svg>
