@@ -115,6 +115,33 @@ Multiple origins can be comma-separated. The download routes expose
 `Content-Disposition`/`Content-Length`, so filenames and progress work
 cross-origin.
 
+## Videos that require sign-in (YouTube cookies)
+
+Cloud/datacenter IPs (Render, Railway, Fly, VPS) are routinely challenged by
+YouTube with **"Sign in to confirm you're not a bot"** on some videos while
+others work fine. There is no cookie-less workaround for those videos; the
+backend supports cookies from a signed-in YouTube session:
+
+1. Sign in to YouTube in a desktop browser.
+2. Export a **Netscape-format** `cookies.txt` for `youtube.com` (e.g. with a
+   "Get cookies.txt LOCALLY" style browser extension).
+3. Base64-encode the file:
+   - Windows PowerShell:
+     `[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))`
+   - macOS/Linux: `base64 -w0 cookies.txt`
+4. On the backend host set `YTDLP_COOKIES_B64` to the encoded value (Render:
+   Environment → Add Environment Variable → mark it secret).
+   `YTDLP_COOKIES_FILE` pointing at a mounted `cookies.txt` also works.
+5. Redeploy/restart, then verify `GET /api/health?diagnostics=1` reports
+   `cookies: { configured: true, ... }` (the startup log prints it too).
+
+Notes:
+
+- Use a throwaway Google account; cookies are credentials. Never commit them.
+- Cookies expire eventually — re-export when those videos start failing again.
+- `getVideoInfo` already retries with the `web_safari`/`tv` player clients
+  before giving up, so only genuinely challenged videos need cookies.
+
 ## Troubleshooting a deployed backend
 
 - `GET https://<backend>/api/health` — `ytDlpVersion: null` means yt-dlp is not
@@ -130,6 +157,10 @@ cross-origin.
 - `POST /api/info` returning the generic "Failed to retrieve video information.
   Please try again." almost always means yt-dlp failed to start or was blocked
   by YouTube; check the diagnostics first.
+- "YouTube is asking this server to verify it isn't a bot for this video" means
+  YouTube demands a signed-in session for that specific video from a datacenter
+  IP. Configure cookies (see the section above); other videos keep working
+  without them.
 - Rebuild the image after pulling new commits: the Dockerfile verifies the
   binaries during the build. On Render use **Manual Deploy → Clear build cache &
   deploy** if an old cached layer still lacks yt-dlp.

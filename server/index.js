@@ -13,6 +13,7 @@ import { recordError } from "./utils/errorLog.js";
 import {
   getYtDlpVersion,
   getRuntimeDiagnostics,
+  getCookiesInfo,
   LOW_MEMORY_HOST,
   SEQUENTIAL_MERGE,
   MEMORY_LIMIT_BYTES,
@@ -117,6 +118,8 @@ app.listen(PORT, async () => {
   );
   const version = await getYtDlpVersion();
   console.log(`yt-dlp binary: ${process.env.YTDLP_BIN || "yt-dlp"}${version ? ` (version ${version})` : " (version unknown)"}`);
+  const cookies = getCookiesInfo();
+  console.log(`yt-dlp cookies: ${cookies.configured ? `configured (${cookies.source})` : "not configured"}`);
   if (!version) {
     console.warn("[startup] yt-dlp is not runnable. Check YTDLP_BIN and the container image; see /api/health?diagnostics=1.");
   }

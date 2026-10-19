@@ -344,7 +344,7 @@ test("buildVideoAttempts starts with the plan's preferred source and retries it"
   assert.equal(attempts[0].selector, "133+140");
   assert.equal(attempts[1].selector, "133+140", "second attempt retries the preferred source");
   assert.ok(attempts[1].delayMs > 0, "retry waits briefly before re-extracting");
-  assert.ok(attempts.length <= 7);
+  assert.ok(attempts.length <= 9, "attempt list stays bounded");
   assert.ok(attempts.every((a) => typeof a.selector === "string" && a.selector.length > 0));
 });
 

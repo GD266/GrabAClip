@@ -18,6 +18,7 @@ Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader bac
 - `ffmpeg` on PATH (override: `FFMPEG_BIN`) — required for every audio download (`-x --audio-format …`) and for merging MP4 video. Both overrides are documented in `.env.example` (a missing `.env` is fine; defaults are the bare binary names).
 - Copy `.env.example` → `.env`. Without `OPENAI_API_KEY`/`AI_API_KEY`, the AI provider silently falls back to `MockProvider` (intelligence responses flagged `isFallback: true`) — `server/services/ai/factory.js`.
 - yt-dlp runs with `--remote-components ejs:github`; JS challenges resolve via **deno** (`[jsc:deno]` in logs) — a soft runtime dependency.
+- Datacenter hosts (Render/Railway/Fly/VPS) get YouTube's "Sign in to confirm you're not a bot" challenge on some videos while others work. Set `YTDLP_COOKIES_B64` (base64 of a Netscape `cookies.txt`) or `YTDLP_COOKIES_FILE` to pass `--cookies` to every yt-dlp call; `getVideoInfo` also retries the `web_safari`/`tv` player clients first. Cookies are a host env var, not part of the image (see `DEPLOY.md`).
 
 ## Layout
 

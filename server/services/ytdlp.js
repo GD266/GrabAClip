@@ -16,6 +16,50 @@ const DOWNLOAD_TIMEOUT_MS = 1200000; // 20min (1080p HLS can be large + slow lin
 const TEMP_ROOT = path.join(os.tmpdir(), "grabaclip");
 
 /**
+ * Optional YouTube cookies. Datacenter IPs (Render, Railway, Fly, VPS) are
+ * routinely challenged by YouTube with "Sign in to confirm you're not a bot"
+ * on some videos; cookies from a signed-in session are the workaround yt-dlp
+ * recommends. Configure exactly one:
+ *   YTDLP_COOKIES_FILE  path to a Netscape-format cookies.txt
+ *   YTDLP_COOKIES_B64   base64 of that file (for hosts without file uploads)
+ */
+function resolveCookiesFile() {
+  const explicit = String(process.env.YTDLP_COOKIES_FILE || "").trim();
+  if (explicit) {
+    try {
+      if (fs.statSync(explicit).isFile()) return { path: explicit, source: "file" };
+    } catch {}
+  }
+
+  const encoded = String(process.env.YTDLP_COOKIES_B64 || "").trim();
+  if (encoded) {
+    try {
+      const content = Buffer.from(encoded, "base64").toString("utf8");
+      // Netscape cookies.txt files are tab separated; reject anything else so a
+      // mistyped env var cannot feed garbage to yt-dlp.
+      if (content.includes("\t")) {
+        fs.mkdirSync(TEMP_ROOT, { recursive: true });
+        const target = path.join(TEMP_ROOT, "cookies.txt");
+        fs.writeFileSync(target, content, { mode: 0o600 });
+        return { path: target, source: "base64" };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+const COOKIES = resolveCookiesFile();
+
+/** Whether/how YouTube cookies are configured (diagnostics + startup log). */
+export function getCookiesInfo() {
+  return { configured: Boolean(COOKIES), source: COOKIES ? COOKIES.source : null };
+}
+
+function cookiesFlags() {
+  return COOKIES ? ["--cookies", COOKIES.path] : [];
+}
+
+/**
  * Memory limit imposed on this process (cgroup limit in a container, system
  * RAM otherwise). `os.totalmem()` reports the host's memory inside a
  * container, so prefer process.constrainedMemory()/cgroup files.
@@ -67,7 +111,7 @@ export const MIME_BY_EXT = {
 };
 
 // Shared yt-dlp flags for info/report style calls (no media transferred).
-const YTDLP_QUIET_FLAGS = ["--no-playlist", "--remote-components", "ejs:github", "--no-warnings", "--no-progress"];
+const YTDLP_QUIET_FLAGS = ["--no-playlist", "--remote-components", "ejs:github", "--no-warnings", "--no-progress", ...cookiesFlags()];
 
 // Flags for media jobs: progress lines are parsed to feed the UI status.
 // Note: the "download:" prefix of --progress-template is the template TYPE,
@@ -92,6 +136,7 @@ const YTDLP_JOB_FLAGS = [
   "10",
   "--retry-sleep",
   "fragment:1",
+  ...cookiesFlags(),
 ];
 
 // Video heights the UI offers, best first.
@@ -123,9 +168,14 @@ export function classifyYtDlpError(stderr, code) {
     return { status: 403, message: "This video is private and cannot be downloaded." };
   }
   // Datacenter-IP bot check ("Sign in to confirm you're not a bot"). The info
-  // fetcher retries alternate player clients before this surfaces.
+  // fetcher retries alternate player clients before this surfaces; a signed-in
+  // cookie file is the reliable fix.
   if (lower.includes("not a bot")) {
-    return { status: 502, message: "YouTube is asking this server to verify it isn't a bot. Please try again in a moment." };
+    return {
+      status: 502,
+      message:
+        "YouTube is asking this server to verify it isn't a bot for this video. Add YouTube cookies to the backend (YTDLP_COOKIES_B64, see DEPLOY.md) or try another video.",
+    };
   }
   // Age-restricted / authentication required — must be checked before generic 403
   if (
@@ -583,7 +633,7 @@ export async function getVideoInfo(rawUrl, options = {}) {
   // videos fail fatally and are not retried.
   let result = null;
   let lastError = null;
-  for (const playerClient of [null, "web_safari", "tv"]) {
+  for (const playerClient of [null, "web_safari", "web_embedded", "tv"]) {
     const args = [...baseArgs];
     if (playerClient) args.push("--extractor-args", `youtube:player_client=${playerClient}`);
     args.push(url);
@@ -795,10 +845,16 @@ export function buildVideoAttempts({ plan = null, height = null, formatId = null
     attempts.splice(1, 0, { ...attempts[0], note: "Source was blocked — retrying with fresh links…", delayMs: 1200 });
   }
 
-  // Last resorts: alternate player clients. web_safari exposes the HLS ladder
-  // and tv/mweb expose progressive formats — different URL sets than default.
+  // Last resorts: alternate player clients. web_safari exposes the full muxed
+  // HLS ladder, web_embedded exposes the DASH ladder (video-only + audio, so
+  // its selector always pairs audio), tv/mweb expose small progressive formats.
   add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]/best`, {
     extractorArgs: ["youtube:player_client=web_safari"],
+    note: "Trying an alternate YouTube player…",
+    delayMs: 800,
+  });
+  add(`bestvideo[height<=${h}]+bestaudio[ext=m4a]/best[height<=${h}][protocol*=m3u8]/best[height<=${h}]`, {
+    extractorArgs: ["youtube:player_client=web_embedded"],
     note: "Trying an alternate YouTube player…",
     delayMs: 800,
   });
@@ -808,7 +864,7 @@ export function buildVideoAttempts({ plan = null, height = null, formatId = null
     delayMs: 800,
   });
 
-  return attempts.slice(0, 7);
+  return attempts.slice(0, 9);
 }
 
 /**
@@ -1445,6 +1501,7 @@ export function getRuntimeDiagnostics() {
     lowMemoryHost: LOW_MEMORY_HOST,
     sequentialMerge: SEQUENTIAL_MERGE,
     concurrentFragments: CONCURRENT_FRAGMENTS,
+    cookies: getCookiesInfo(),
     ytDlp: inspectBinary(YTDLP_BIN, ["--version"]),
     ffmpeg: inspectBinary(process.env.FFMPEG_BIN || "ffmpeg", ["-version"]),
     deno: inspectBinary(process.env.DENO_BIN || "deno", ["--version"]),
