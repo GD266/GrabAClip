@@ -834,7 +834,11 @@ getIntelligenceBtn.addEventListener("click", getIntelligence);
 async function checkApiAvailability() {
   try {
     const res = await fetch(apiUrl("/api/downloads/status"));
-    if (res.status === 404) setStatus(statusEl, apiHint(), "error");
+    const contentType = res.headers.get("content-type") || "";
+    // Static hosts often answer unknown paths with index.html (200), not 404.
+    if (res.status === 404 || !contentType.includes("application/json")) {
+      setStatus(statusEl, apiHint(), "error");
+    }
   } catch {
     // Offline / cold start: the user sees a network error when they submit.
   }
