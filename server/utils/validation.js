@@ -1,4 +1,6 @@
-import { isYouTubeUrl, extractVideoId, normalizeYouTubeUrl } from "../../shared/validator.js";
+// The validator lives in public/ so the same file is served to the browser
+// both by Express locally and by static hosts such as Vercel.
+import { isYouTubeUrl, extractVideoId, normalizeYouTubeUrl } from "../../public/shared/validator.js";
 
 export { isYouTubeUrl, extractVideoId, normalizeYouTubeUrl };
 

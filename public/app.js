@@ -1,6 +1,40 @@
 // Grab a Clip — frontend logic
 import { isYouTubeUrl, extractVideoId, normalizeYouTubeUrl } from "/shared/validator.js";
 
+// The API may live on another origin (Vercel frontend + container backend).
+// `public/config.js` sets window.GAC_API_BASE; empty means same origin.
+const API_BASE = String((typeof window !== "undefined" && window.GAC_API_BASE) || "")
+  .trim()
+  .replace(/\/+$/, "");
+
+function apiUrl(path) {
+  return `${API_BASE}${path}`;
+}
+
+function apiHint() {
+  if (API_BASE) {
+    return `Could not reach the downloader API at ${API_BASE}. Check that the backend is running and that CORS allows this origin.`;
+  }
+  return "No downloader backend is configured for this page. Deploy the backend (see DEPLOY.md) and set GAC_API_BASE to its URL.";
+}
+
+async function readApiJson(response) {
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    return response.json().catch(() => ({}));
+  }
+  // A static host (or a proxy) answered with HTML/text: the API is missing.
+  await response.text().catch(() => "");
+  return { error: `Downloader API unavailable (HTTP ${response.status}). ${apiHint()}` };
+}
+
+function errorMessage(err, fallback) {
+  if (err instanceof TypeError && /fetch|network/i.test(err.message || "")) {
+    return `Could not reach the downloader API. ${apiHint()}`;
+  }
+  return err?.message || fallback;
+}
+
 const $ = (id) => document.getElementById(id);
 
 // Hero
@@ -183,13 +217,13 @@ async function getVideo() {
   resultArea.classList.add("hidden");
 
   try {
-    const res = await fetch("/api/info", {
+    const res = await fetch(apiUrl("/api/info"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url: normalizedUrl }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Failed to retrieve video information.");
+    const data = await readApiJson(res);
+    if (!res.ok) throw new Error(data.error || `Failed to retrieve video information. ${apiHint()}`);
 
     currentUrl = normalizedUrl;
     currentInfo = data;
@@ -244,7 +278,7 @@ async function getVideo() {
     activateTab("video");
     setStatus(statusEl, "Video ready. Pick a quality and download.", "success");
   } catch (err) {
-    setStatus(statusEl, err.message || "An error occurred.", "error");
+    setStatus(statusEl, errorMessage(err, "An error occurred."), "error");
     resultArea.classList.add("hidden");
   } finally {
     getVideoBtn.disabled = false;
@@ -413,8 +447,8 @@ function downloadWithProgress(url, { statusEl: statusTarget, progressEl }, onPro
         const errData = await response.json().catch(() => ({}));
         message = errData.error || message;
       } else {
-        const text = await response.text().catch(() => "");
-        message = text ? `${message} ${text.slice(0, 200)}` : message;
+        await response.text().catch(() => {});
+        message = `${message} ${apiHint()}`;
       }
       throw new Error(message);
     }
@@ -494,7 +528,7 @@ function startPhasePolling(type, url, statusTarget, progressEl, estimatedBytes =
 
   state.poll = setInterval(async () => {
     try {
-      const res = await fetch("/api/downloads/status");
+      const res = await fetch(apiUrl("/api/downloads/status"));
       if (!res.ok) return;
       const data = await res.json();
       // Match on the canonical URL, falling back to the video id so the job is
@@ -600,7 +634,7 @@ async function downloadVideo() {
   // The default plan set is the smaller AV1/VP9 one; unchecking the box asks
   // the server for the H.264 plans instead.
   params.set("codec", smallFileToggle && !smallFileToggle.checked ? "h264" : "small");
-  const downloadUrl = `/api/download?${params.toString()}`;
+  const downloadUrl = apiUrl(`/api/download?${params.toString()}`);
 
   setDownloading("video", true);
   resetProgress(videoProgressEl);
@@ -630,7 +664,7 @@ async function downloadVideo() {
     setStatus(downloadStatusEl, `Complete: ${filename} (${formatBytesProgress(blob.size)})`, "success");
   } catch (err) {
     if (err.name === "AbortError") setStatus(downloadStatusEl, "Download cancelled.", "error");
-    else setStatus(downloadStatusEl, err.message || "Download failed.", "error");
+    else setStatus(downloadStatusEl, errorMessage(err, "Download failed."), "error");
   } finally {
     stopPhasePolling("video");
     receivedBytes.video = 0;
@@ -651,7 +685,7 @@ async function downloadAudio() {
 
   const params = new URLSearchParams({ url: currentUrl, format: selectedAudio.id });
   if (selectedAudio.quality != null) params.set("quality", String(selectedAudio.quality));
-  const downloadUrl = `/api/download/audio?${params.toString()}`;
+  const downloadUrl = apiUrl(`/api/download/audio?${params.toString()}`);
 
   setDownloading("audio", true);
   resetProgress(audioProgressEl);
@@ -680,7 +714,7 @@ async function downloadAudio() {
     setStatus(audioStatusEl, `Complete: ${filename} (${formatBytesProgress(blob.size)})`, "success");
   } catch (err) {
     if (err.name === "AbortError") setStatus(audioStatusEl, "Audio download cancelled.", "error");
-    else setStatus(audioStatusEl, err.message || "Audio download failed.", "error");
+    else setStatus(audioStatusEl, errorMessage(err, "Audio download failed."), "error");
   } finally {
     stopPhasePolling("audio");
     receivedBytes.audio = 0;
@@ -710,13 +744,13 @@ async function getIntelligence() {
   setStatus(aiErrorEl, "", "");
 
   try {
-    const res = await fetch("/api/intelligence", {
+    const res = await fetch(apiUrl("/api/intelligence"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Intelligence failed");
+    const data = await readApiJson(res);
+    if (!res.ok) throw new Error(data.error || `Intelligence failed. ${apiHint()}`);
 
     if (data.video) {
       if (data.video.uploadDateFormatted) vUploadDateEl.textContent = data.video.uploadDateFormatted;
@@ -763,7 +797,7 @@ async function getIntelligence() {
       if (data.intelligence?.aiError) setStatus(aiErrorEl, data.intelligence.aiError, "error");
     }
   } catch (err) {
-    setStatus(intelligenceStatusEl, err.message || "Intelligence failed.", "error");
+    setStatus(intelligenceStatusEl, errorMessage(err, "Intelligence failed."), "error");
     intelligenceContentEl.classList.add("hidden");
   } finally {
     getIntelligenceBtn.disabled = false;
@@ -793,3 +827,16 @@ if (smallFileToggle) smallFileToggle.addEventListener("change", refreshVideoOpti
 cancelVideoBtn.addEventListener("click", () => cancelDownload("video"));
 cancelAudioBtn.addEventListener("click", () => cancelDownload("audio"));
 getIntelligenceBtn.addEventListener("click", getIntelligence);
+
+// A Vercel/static deployment has no API on its own. Probe the status endpoint
+// (cheap, no yt-dlp spawn) and explain the missing backend instead of failing
+// silently on the first "Get video" click.
+async function checkApiAvailability() {
+  try {
+    const res = await fetch(apiUrl("/api/downloads/status"));
+    if (res.status === 404) setStatus(statusEl, apiHint(), "error");
+  } catch {
+    // Offline / cold start: the user sees a network error when they submit.
+  }
+}
+checkApiAvailability();

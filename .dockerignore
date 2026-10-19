@@ -1,0 +1,12 @@
+node_modules
+.git
+.gitignore
+.env
+npm-debug.log*
+*.mp4
+*.m4a
+*.webm
+*.part
+*.vtt
+*.srt
+grabaclip.log

@@ -19,7 +19,20 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors());
+// The frontend may be hosted on another origin (e.g. Vercel) while the API
+// runs in a container. CORS is open by default so that split deployment works;
+// set CORS_ORIGIN (comma-separated) to restrict it in production.
+const corsOrigins = String(process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: corsOrigins.length ? corsOrigins : "*",
+    exposedHeaders: ["Content-Length", "Content-Disposition"],
+  })
+);
 app.use(express.json({ limit: "100kb" }));
 app.use(express.urlencoded({ extended: false }));
 
@@ -52,11 +65,8 @@ app.use("/api/download/audio", audioRouter);
 app.use("/api/download", downloadRouter);
 app.use("/api/intelligence", intelligenceRouter);
 
-// Serve frontend
+// Serve frontend (includes the shared validator at /shared/validator.js).
 app.use(express.static(path.join(ROOT, "public")));
-
-// Shared code (canonical YouTube URL validation) is imported by the frontend.
-app.use("/shared", express.static(path.join(ROOT, "shared")));
 
 // Fallback to index.html for SPA-like behavior (or just serve file for unknown routes that accept html)
 app.get("*", (req, res) => {

@@ -21,10 +21,10 @@ Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader bac
 
 ## Layout
 
-- `server/index.js` — entrypoint; mounts `/api/*`, serves `public/` and `/shared` statically, SPA fallback for other paths (Express **4** syntax `app.get("*")`).
+- `server/index.js` — entrypoint; mounts `/api/*`, serves `public/` statically (including `/shared/validator.js`), SPA fallback for other paths (Express **4** syntax `app.get("*")`). CORS is open by default or restricted with `CORS_ORIGIN`.
 - Endpoints: POST `/api/info`, POST `/api/intelligence`, GET `/api/download` (video), GET `/api/download/audio`, GET `/api/downloads/status`, GET `/api/health`.
 - `server/routes/` — HTTP layer; `server/services/` — yt-dlp jobs, transcript, AI logic; `server/utils/` — validation + download status; `test/` — `node:test` unit tests.
-- `shared/validator.js` — canonical URL validation (re-exported by `server/utils/validation.js`) and imported directly by `public/app.js` as `/shared/validator.js` (mounted in `server/index.js`).
+- `public/shared/validator.js` — canonical URL validation. It lives under `public/` so the browser can import it as `/shared/validator.js` from both Express (local) and static hosts (Vercel); `server/utils/validation.js` imports the same file.
 
 ## How downloads work (rewritten 2026-10-19)
 
@@ -54,6 +54,14 @@ Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader bac
 - `classifyYtDlpError` (`server/services/ytdlp.js`) is the **single** source of friendly error strings — routes call it, they do not re-implement matching. Covered by `test/ytdlp.test.js`.
 - Timeouts: info 30s, transcript 30s, download jobs 20 min (`DOWNLOAD_TIMEOUT_MS` in `ytdlp.js` / `transcript.js`).
 - `.env` and media artifacts (`*.mp4`, `*.part`, `*.vtt`, `*.srt`) are gitignored — never commit them. Commits use conventional style (`feat: ...`, `fix: ...`).
+
+## Deployment (Vercel + backend)
+
+- **Vercel can only host the static frontend.** `yt-dlp`/`ffmpeg` are native binaries and jobs are long-running/large, so Vercel Functions cannot run the API. Deploy the backend with the included `Dockerfile` (Render/Railway/Fly/VPS) and point the frontend at it.
+- `vercel.json` sets `outputDirectory: "public"` and runs `scripts/vercel-build.js`. Set `GAC_API_BASE` in the Vercel project (no trailing slash, no `/api`) to write the backend URL into `public/config.js`; if unset, the committed `public/config.js` is kept. Locally the value is empty and API calls are same-origin.
+- `public/index.html` loads `/config.js` before the `app.js` module; `public/app.js` routes every API call through `apiUrl()`.
+- The backend exposes `Content-Disposition`/`Content-Length` through CORS. `CORS_ORIGIN` (comma-separated) restricts origins; the default is `*`.
+- Full steps and host notes: `DEPLOY.md`.
 
 ## Known issues (verified 2026-10-19)
 

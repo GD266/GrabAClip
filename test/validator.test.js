@@ -6,7 +6,7 @@ import {
   isValidVideoId,
   isYouTubeUrl,
   normalizeYouTubeUrl,
-} from "../shared/validator.js";
+} from "../public/shared/validator.js";
 
 import {
   validateDownloadQuery,
@@ -17,7 +17,7 @@ import {
 } from "../server/utils/validation.js";
 
 // ---------------------------------------------------------------------------
-// shared/validator.js
+// shared/validator.js (served from public/shared/)
 // ---------------------------------------------------------------------------
 
 test("extractVideoId handles watch, short, embed and youtu.be URLs", () => {
