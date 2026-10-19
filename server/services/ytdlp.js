@@ -5,6 +5,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { isYouTubeUrl, normalizeYouTubeUrl } from "../utils/validation.js";
+import { getRecentErrors } from "../utils/errorLog.js";
 
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 const INFO_TIMEOUT_MS = 30000; // 30s
@@ -13,6 +14,44 @@ const DOWNLOAD_TIMEOUT_MS = 1200000; // 20min (1080p HLS can be large + slow lin
 // Temp workspace for media jobs. yt-dlp needs a real file so it can run its
 // HLS (TS -> MP4) fixup, merge video+audio into MP4, and postprocess audio.
 const TEMP_ROOT = path.join(os.tmpdir(), "grabaclip");
+
+/**
+ * Memory limit imposed on this process (cgroup limit in a container, system
+ * RAM otherwise). `os.totalmem()` reports the host's memory inside a
+ * container, so prefer process.constrainedMemory()/cgroup files.
+ */
+function detectMemoryLimitBytes() {
+  const constrained = typeof process.constrainedMemory === "function" ? process.constrainedMemory() : 0;
+  if (constrained > 0) return constrained;
+  for (const file of ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"]) {
+    try {
+      const raw = fs.readFileSync(file, "utf8").trim();
+      if (raw && raw !== "max") {
+        const bytes = Number(raw);
+        if (Number.isFinite(bytes) && bytes > 0) return bytes;
+      }
+    } catch {}
+  }
+  return os.totalmem();
+}
+
+export const MEMORY_LIMIT_BYTES = detectMemoryLimitBytes();
+
+// Small containers (Render free = 512 MB) cannot host two yt-dlp processes at
+// once: each may spawn a Deno JS-challenge runtime, and the container gets
+// OOM-killed mid-download. On those hosts a job runs as a single yt-dlp
+// process (it downloads video, then audio, and merges them itself) and pulls
+// fewer fragments in parallel.
+// Overrides: GAC_LOW_MEMORY=1|0, GAC_SEQUENTIAL_MERGE=1|0, GAC_CONCURRENT_FRAGMENTS=n
+export const LOW_MEMORY_HOST =
+  process.env.GAC_LOW_MEMORY === "1" ||
+  (process.env.GAC_LOW_MEMORY !== "0" && MEMORY_LIMIT_BYTES > 0 && MEMORY_LIMIT_BYTES <= 1536 * 1024 * 1024);
+
+export const SEQUENTIAL_MERGE =
+  process.env.GAC_SEQUENTIAL_MERGE === "1" ||
+  (process.env.GAC_SEQUENTIAL_MERGE !== "0" && LOW_MEMORY_HOST);
+
+const CONCURRENT_FRAGMENTS = String(process.env.GAC_CONCURRENT_FRAGMENTS || (LOW_MEMORY_HOST ? 2 : 8));
 
 export const MIME_BY_EXT = {
   mp4: "video/mp4",
@@ -42,8 +81,9 @@ const YTDLP_JOB_FLAGS = [
   // Pull HLS/DASH fragments in parallel: single YouTube connections are
   // bandwidth-throttled, and multi-fragment downloads are much faster for
   // long videos. Ignored for single-file (progressive/https) formats.
+  // Lowered on memory-constrained hosts (see LOW_MEMORY_HOST above).
   "--concurrent-fragments",
-  "8",
+  CONCURRENT_FRAGMENTS,
   "--progress-template",
   "download:GACDL %(progress._percent_str)s",
   "--retries",
@@ -718,7 +758,9 @@ export function buildVideoAttempts({ plan = null, height = null, formatId = null
 
   // Retry the preferred source once with a fresh extraction before falling
   // back: media URLs are time-limited, so a new one often just works.
-  if (plan?.kind === "merge" && plan.formatIds?.length === 2) {
+  // The concurrent two-process merge is skipped on memory-constrained hosts;
+  // the combined `video+audio` selector then runs inside one yt-dlp process.
+  if (plan?.kind === "merge" && plan.formatIds?.length === 2 && !SEQUENTIAL_MERGE) {
     const [videoId, audioId] = plan.formatIds;
     const primary = attempts[0];
     if (primary) primary.merge = { videoSelector: videoId, audioSelector: audioId };
@@ -1364,14 +1406,28 @@ function inspectBinary(bin, args) {
  * permission error, ...).
  */
 export function getRuntimeDiagnostics() {
+  const usage = process.memoryUsage();
   return {
     platform: process.platform,
     arch: process.arch,
     node: process.version,
     path: process.env.PATH || "",
+    pid: process.pid,
+    uptimeSeconds: Math.round(process.uptime()),
+    memory: {
+      limitBytes: MEMORY_LIMIT_BYTES,
+      totalBytes: os.totalmem(),
+      freeBytes: os.freemem(),
+      rssBytes: usage.rss,
+      heapUsedBytes: usage.heapUsed,
+    },
+    lowMemoryHost: LOW_MEMORY_HOST,
+    sequentialMerge: SEQUENTIAL_MERGE,
+    concurrentFragments: CONCURRENT_FRAGMENTS,
     ytDlp: inspectBinary(YTDLP_BIN, ["--version"]),
     ffmpeg: inspectBinary(process.env.FFMPEG_BIN || "ffmpeg", ["-version"]),
     deno: inspectBinary(process.env.DENO_BIN || "deno", ["--version"]),
+    recentErrors: getRecentErrors(),
   };
 }
 

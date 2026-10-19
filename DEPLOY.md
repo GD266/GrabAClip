@@ -120,7 +120,13 @@ cross-origin.
 - `GET https://<backend>/api/health` — `ytDlpVersion: null` means yt-dlp is not
   runnable in the container (missing binary, wrong architecture, permission).
 - `GET https://<backend>/api/health?diagnostics=1` — shows the resolved path,
-  exit code and stderr for yt-dlp, ffmpeg and deno.
+  exit code and stderr for yt-dlp, ffmpeg and deno, the container memory limit,
+  `lowMemoryHost`/`sequentialMerge`, `uptimeSeconds` and `recentErrors`.
+- A download that dies with a bare 502 from the host (no CORS headers, status
+  polling suddenly returns invalid JSON) usually means the container was
+  killed. On a 512 MB instance the likely cause is memory: the image
+  automatically switches to a single yt-dlp process and 2 fragments. Check
+  `lowMemoryHost` in the diagnostics; force it with `GAC_LOW_MEMORY=1`.
 - `POST /api/info` returning the generic "Failed to retrieve video information.
   Please try again." almost always means yt-dlp failed to start or was blocked
   by YouTube; check the diagnostics first.

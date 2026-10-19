@@ -9,7 +9,14 @@ import downloadRouter from "./routes/download.js";
 import intelligenceRouter from "./routes/intelligence.js";
 import audioRouter from "./routes/audio.js";
 import { getActiveDownloads } from "./utils/downloadStatus.js";
-import { getYtDlpVersion, getRuntimeDiagnostics } from "./services/ytdlp.js";
+import { recordError } from "./utils/errorLog.js";
+import {
+  getYtDlpVersion,
+  getRuntimeDiagnostics,
+  LOW_MEMORY_HOST,
+  SEQUENTIAL_MERGE,
+  MEMORY_LIMIT_BYTES,
+} from "./services/ytdlp.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -83,12 +90,31 @@ app.get("*", (req, res) => {
 // Global error handler
 app.use((err, req, res, next) => {
   console.error("[unhandled]", err);
+  recordError("express", err);
   if (res.headersSent) return next(err);
   res.status(500).json({ error: "Internal server error." });
 });
 
+// Never let a stray rejected promise / thrown async error kill the downloader.
+// The entry is kept in memory and exposed by /api/health?diagnostics=1.
+process.on("unhandledRejection", (reason) => {
+  const entry = recordError("unhandledRejection", reason);
+  console.error(`[unhandledRejection] ${entry.message}`);
+  if (reason instanceof Error && reason.stack) console.error(reason.stack);
+});
+
+process.on("uncaughtException", (error) => {
+  const entry = recordError("uncaughtException", error);
+  console.error(`[uncaughtException] ${entry.message}`);
+  if (error instanceof Error && error.stack) console.error(error.stack);
+});
+
 app.listen(PORT, async () => {
   console.log(`Grab a Clip server running at http://localhost:${PORT}`);
+  console.log(
+    `host memory limit: ${Math.round(MEMORY_LIMIT_BYTES / 1024 / 1024)} MB ` +
+      `(low-memory mode: ${LOW_MEMORY_HOST ? "on" : "off"}, sequential merge: ${SEQUENTIAL_MERGE ? "on" : "off"})`
+  );
   const version = await getYtDlpVersion();
   console.log(`yt-dlp binary: ${process.env.YTDLP_BIN || "yt-dlp"}${version ? ` (version ${version})` : " (version unknown)"}`);
   if (!version) {
