@@ -124,7 +124,7 @@ export function classifyYtDlpError(stderr, code) {
   }
   // Datacenter-IP bot check ("Sign in to confirm you're not a bot"). The info
   // fetcher retries alternate player clients before this surfaces.
-  if (lower.includes("confirm you're not a bot") || lower.includes("confirm you’re not a bot") || lower.includes("sign in to confirm")) {
+  if (lower.includes("not a bot")) {
     return { status: 502, message: "YouTube is asking this server to verify it isn't a bot. Please try again in a moment." };
   }
   // Age-restricted / authentication required — must be checked before generic 403
