@@ -115,6 +115,19 @@ Multiple origins can be comma-separated. The download routes expose
 `Content-Disposition`/`Content-Length`, so filenames and progress work
 cross-origin.
 
+## Troubleshooting a deployed backend
+
+- `GET https://<backend>/api/health` — `ytDlpVersion: null` means yt-dlp is not
+  runnable in the container (missing binary, wrong architecture, permission).
+- `GET https://<backend>/api/health?diagnostics=1` — shows the resolved path,
+  exit code and stderr for yt-dlp, ffmpeg and deno.
+- `POST /api/info` returning the generic "Failed to retrieve video information.
+  Please try again." almost always means yt-dlp failed to start or was blocked
+  by YouTube; check the diagnostics first.
+- Rebuild the image after pulling new commits: the Dockerfile verifies the
+  binaries during the build. On Render use **Manual Deploy → Clear build cache &
+  deploy** if an old cached layer still lacks yt-dlp.
+
 ---
 
 ## Important notes

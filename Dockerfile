@@ -3,6 +3,11 @@
 # yt-dlp and ffmpeg are native binaries that cannot run in Vercel Functions.
 # This image is the deployable downloader; the Vercel deployment can serve the
 # static frontend and point at this container with GAC_API_BASE (see DEPLOY.md).
+
+# Deno runtime for yt-dlp's JavaScript challenges. The `bin` image contains the
+# binary at /deno; copying it avoids a network installer in the build.
+FROM denoland/deno:bin AS deno
+
 FROM node:22-bookworm-slim
 
 ENV NODE_ENV=production \
@@ -12,17 +17,20 @@ ENV NODE_ENV=production \
     FFPROBE_BIN=ffprobe
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg unzip \
+ && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg python3 python3-pip \
  && rm -rf /var/lib/apt/lists/*
 
-# Standalone yt-dlp (rebuild/redeploy the image regularly: a stale yt-dlp is the
-# usual cause of YouTube 403s).
-RUN curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-      -o /usr/local/bin/yt-dlp \
- && chmod a+rx /usr/local/bin/yt-dlp
+# Install yt-dlp from PyPI. The standalone GitHub release asset can be blocked
+# or served as a non-binary page by CI proxies; pip is reliable. The build stops
+# here if the installed binary cannot run.
+RUN python3 -m pip install --no-cache-dir --break-system-packages -U yt-dlp \
+ && yt-dlp --version
 
-# Deno solves yt-dlp's JavaScript challenges (--remote-components ejs:github).
-RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+COPY --from=deno /deno /usr/local/bin/deno
+RUN deno --version
+
+# Fail the image build if the media tools are unusable.
+RUN ffmpeg -version >/dev/null && ffprobe -version >/dev/null
 
 WORKDIR /app
 

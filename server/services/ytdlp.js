@@ -1,4 +1,4 @@
-import { spawn, execSync } from "node:child_process";
+import { spawn, spawnSync, execSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1305,6 +1305,74 @@ export function getYtDlpVersion() {
       .catch(() => null);
   }
   return versionPromise;
+}
+
+/**
+ * Resolve a bare command name against PATH without relying on `which`/`where`
+ * (not always present in slim container images).
+ */
+function resolveOnPath(bin) {
+  if (!bin) return null;
+  if (bin.includes("/") || bin.includes("\\")) return bin;
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
+  for (const dir of String(process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = path.join(dir, bin + ext);
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function inspectBinary(bin, args) {
+  let result;
+  try {
+    result = spawnSync(bin, args, { encoding: "utf8", timeout: 15000, windowsHide: true });
+  } catch (e) {
+    result = { error: e, status: null, signal: null, stdout: "", stderr: "" };
+  }
+
+  const resolvedPath = resolveOnPath(bin);
+  let file = null;
+  if (resolvedPath) {
+    try {
+      const stat = fs.statSync(resolvedPath);
+      file = { size: stat.size, mode: (stat.mode & 0o777).toString(8) };
+    } catch {}
+  }
+
+  return {
+    bin,
+    resolvedPath,
+    file,
+    status: result.status,
+    signal: result.signal,
+    error: result.error
+      ? { code: result.error.code || null, message: result.error.message || String(result.error) }
+      : null,
+    stdout: String(result.stdout || "").trim().slice(0, 300),
+    stderr: String(result.stderr || "").trim().slice(0, 500),
+  };
+}
+
+/**
+ * Deployment diagnostics for /api/health?diagnostics=1. Explains whether the
+ * container can actually run yt-dlp/ffmpeg/deno (missing binary, bad arch,
+ * permission error, ...).
+ */
+export function getRuntimeDiagnostics() {
+  return {
+    platform: process.platform,
+    arch: process.arch,
+    node: process.version,
+    path: process.env.PATH || "",
+    ytDlp: inspectBinary(YTDLP_BIN, ["--version"]),
+    ffmpeg: inspectBinary(process.env.FFMPEG_BIN || "ffmpeg", ["-version"]),
+    deno: inspectBinary(process.env.DENO_BIN || "deno", ["--version"]),
+  };
 }
 
 /**

@@ -59,6 +59,8 @@ Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader bac
 
 - **Vercel can only host the static frontend.** `yt-dlp`/`ffmpeg` are native binaries and jobs are long-running/large, so Vercel Functions cannot run the API. Deploy the backend with the included `Dockerfile` (Render/Railway/Fly/VPS) and point the frontend at it.
 - `vercel.json` sets `outputDirectory: "public"` and runs `scripts/vercel-build.js`. Set `GAC_API_BASE` in the Vercel project (no trailing slash, no `/api`) to write the backend URL into `public/config.js`; if unset, the committed `public/config.js` is kept. Locally the value is empty and API calls are same-origin.
+- The `Dockerfile` installs yt-dlp from PyPI, copies Deno from `denoland/deno:bin`, and runs `yt-dlp --version` / `deno --version` / `ffmpeg -version` at build time, so a broken image fails the deploy instead of serving 500s.
+- `GET /api/health?diagnostics=1` returns resolved paths, exit codes and stderr for yt-dlp/ffmpeg/deno. Use it when a deployed backend returns "Failed to retrieve video information" (a null `ytDlpVersion` in `/api/health` means yt-dlp is not runnable in the container).
 - `public/index.html` loads `/config.js` before the `app.js` module; `public/app.js` routes every API call through `apiUrl()`.
 - The backend exposes `Content-Disposition`/`Content-Length` through CORS. `CORS_ORIGIN` (comma-separated) restricts origins; the default is `*`.
 - Full steps and host notes: `DEPLOY.md`.

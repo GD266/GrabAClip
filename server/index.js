@@ -9,7 +9,7 @@ import downloadRouter from "./routes/download.js";
 import intelligenceRouter from "./routes/intelligence.js";
 import audioRouter from "./routes/audio.js";
 import { getActiveDownloads } from "./utils/downloadStatus.js";
-import { getYtDlpVersion } from "./services/ytdlp.js";
+import { getYtDlpVersion, getRuntimeDiagnostics } from "./services/ytdlp.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -51,7 +51,10 @@ app.use((req, res, next) => {
 // stale versions get their media URLs rejected by YouTube (HTTP 403).
 app.get("/api/health", async (req, res) => {
   const version = await getYtDlpVersion();
-  res.json({ status: "ok", ytDlp: process.env.YTDLP_BIN || "yt-dlp", ytDlpVersion: version });
+  const payload = { status: "ok", ytDlp: process.env.YTDLP_BIN || "yt-dlp", ytDlpVersion: version };
+  // `?diagnostics=1` reports whether the container can run its native tools.
+  if (req.query.diagnostics === "1") payload.diagnostics = getRuntimeDiagnostics();
+  res.json(payload);
 });
 
 // Active downloads status
@@ -88,4 +91,7 @@ app.listen(PORT, async () => {
   console.log(`Grab a Clip server running at http://localhost:${PORT}`);
   const version = await getYtDlpVersion();
   console.log(`yt-dlp binary: ${process.env.YTDLP_BIN || "yt-dlp"}${version ? ` (version ${version})` : " (version unknown)"}`);
+  if (!version) {
+    console.warn("[startup] yt-dlp is not runnable. Check YTDLP_BIN and the container image; see /api/health?diagnostics=1.");
+  }
 });
