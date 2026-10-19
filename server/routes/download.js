@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { validateDownloadQuery, sanitizeFilename, sanitizeAsciiFilename } from "../utils/validation.js";
 import {
   startVideoDownload,
+  startMergeDownload,
   getVideoInfo,
   classifyYtDlpError,
   buildVideoAttempts,
@@ -129,7 +130,21 @@ router.get("/", async (req, res) => {
 
   const result = await runMediaJob({
     attempts,
-    startJob: (attempt) => startVideoDownload(normalizedUrl, attempt),
+    startJob: (attempt) => {
+      // Merge plans download video and audio concurrently (much faster on
+      // throttled connections) and mux them locally; everything else is a
+      // regular single yt-dlp job.
+      if (attempt.merge) {
+        return startMergeDownload(normalizedUrl, {
+          videoSelector: attempt.merge.videoSelector,
+          audioSelector: attempt.merge.audioSelector,
+          extractorArgs: attempt.extractorArgs || null,
+          videoSize: plan?.videoSize,
+          audioSize: plan?.audioSize,
+        });
+      }
+      return startVideoDownload(normalizedUrl, attempt);
+    },
     onProgress: (pct) => setProgressDetail("video", normalizedUrl, pct, `Downloading from YouTube… ${Math.round(pct)}%`),
     onDetail: (text) => setProgressDetail("video", normalizedUrl, null, text),
     signal: jobController.signal,

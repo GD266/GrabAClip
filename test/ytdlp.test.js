@@ -318,6 +318,25 @@ test("buildVideoAttempts supports the legacy raw formatId selection", () => {
   assert.match(attempts[0].selector, /^137\+/);
 });
 
+test("merge plans expose separate video/audio estimates and parallel-download attempts", () => {
+  const [plan] = buildVideoFormats([dashVideo240, dashAudio140], 100);
+  assert.equal(plan.videoSize, 2500000);
+  assert.equal(plan.audioSize, 1600000);
+  assert.equal(plan.estimatedSize, plan.videoSize + plan.audioSize);
+
+  const attempts = buildVideoAttempts({ plan, height: 240 });
+  assert.deepEqual(attempts[0].merge, { videoSelector: "133", audioSelector: "140" });
+  assert.deepEqual(attempts[1].merge, attempts[0].merge, "the fresh retry keeps the merge plan");
+
+  const audioFallback = attempts.find((a) => a.merge && a.merge.audioSelector.includes("bestaudio"));
+  assert.ok(audioFallback, "expected an audio-fallback merge attempt");
+  assert.equal(audioFallback.merge.videoSelector, "133");
+
+  // Muxed/progressive attempts must stay single-process downloads.
+  const muxedAttempts = buildVideoAttempts({ plan: buildVideoFormats([hls93])[0], height: 360 });
+  assert.equal(muxedAttempts[0].merge, undefined);
+});
+
 test("buildAudioAttempts tries the preferred source, then audio-only and player fallbacks", () => {
   const attempts = buildAudioAttempts({ sourceFormatId: "93" });
   assert.match(attempts[0].selector, /^93\//);

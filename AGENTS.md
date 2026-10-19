@@ -29,15 +29,18 @@ Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader bac
 ## How downloads work (rewritten 2026-10-19)
 
 1. `GET /api/download?url=…&height=720` (legacy `formatId=` still accepted) resolves a per-height **plan** (`buildVideoFormats` in `server/services/ytdlp.js`) and starts a yt-dlp job for video **with audio**.
-   - Plan preference per height: muxed **HLS** variant → **merge** (DASH video-only + best m4a audio) → progressive (last resort).
+   - Plan preference per height: muxed **HLS** variant → **merge** (DASH/HLS video-only + best m4a audio) → progressive (last resort). Plans carry `videoSize`/`audioSize` estimates (used for progress weighting and the UI size hints).
    - Every plan carries an ordered `selectors` list; `buildVideoAttempts` turns it into a fallback chain: preferred source → fresh retry (new media URLs) → safer selectors → alternate YouTube players (`youtube:player_client=web_safari` / `tv`). `buildAudioAttempts` does the same for audio (HLS ladder → audio-only → smallest muxed variant via alternate players).
    - `runMediaJob` executes the chain: non-fatal failures (403, network, missing format, no output file) move to the next attempt; `isFatalDownloadError` (unavailable/private/age/region/live) stops immediately. Abort (client disconnect) kills the running process tree.
+   - **Merge plans download video and audio concurrently** (`startMergeDownload`): two yt-dlp processes, then `ffmpeg -c copy -movflags +faststart`. yt-dlp's own merge downloads the streams sequentially; concurrent streams win on connections where YouTube throttles each connection separately. It is bandwidth-neutral on connections with a hard aggregate cap.
+   - Jobs use `--concurrent-fragments 8`, so HLS/DASH fragments download in parallel.
    - Heights are capped at 1080p (UI list: 1080/720/480/360/240/144).
 2. `GET /api/download/audio?url=…&format=m4a|mp3|wav|opus&quality=320|192|128` starts an audio-only job; UI offers M4A / MP3 320/192/128 / WAV. Source: HLS ladder `93/94/95/96/92/91` (AAC-LC 128k preferred over HE-AAC), falling back to `bestaudio`. `best`/`high`/`aac` are aliases for `m4a`.
 3. Jobs are **file based**: yt-dlp writes into a temp dir (`os.tmpdir()/grabaclip/job-*`, deleted afterwards) so it can run its own postprocessing — TS→MP4 fixup for HLS, `--merge-output-format mp4`, `-x --audio-format …` via ffmpeg. Piping to stdout is what used to produce MPEG-TS files named `.mp4` and extradata-less M4A — do not go back to piping.
 4. When yt-dlp exits 0 the finished file is streamed to the client with an exact `Content-Length`; the temp dir is removed once the response (or a client abort) finishes.
 5. Progress: `--progress-template "download:GACDL %(progress._percent_str)s"` (the `download:` prefix is the template TYPE and is not printed) is parsed from stdout into `/api/downloads/status` (`progress`, `detail`). Phases: `preparing → fetching → processing → downloading → complete|failed`; the UI polls this while waiting for response headers. Retry attempts show up in `detail` as `… (attempt n/N)`.
 6. **Info cache** (`server/utils/infoCache.js`, 10 min TTL, dedupes concurrent loads): `/api/info` populates it and both download routes read through it, so clicking Download starts the job immediately instead of paying for another `--dump-json` round trip. Format *ids* are stable; media URLs are re-extracted per job anyway, so cached entries are safe to reuse.
+7. The UI shows server-side progress by polling `/api/downloads/status`. **All status URLs are canonical** (`normalizeYouTubeUrl`), so the frontend must normalize the pasted URL before downloading/polling (`public/app.js` keeps `currentUrl = normalizeYouTubeUrl(input)` and also matches entries by video id). Without that, `youtu.be`/mobile/parameterised links never match a status entry and the UI looks frozen at "Starting download…".
 
 ## Gotchas
 
@@ -52,6 +55,7 @@ Grab a Clip — single-package Node.js (ESM) Express app: YouTube downloader bac
 
 ## Known issues (verified 2026-10-19)
 
+- Download speed is bounded by YouTube/network throughput: this machine measured ~0.5–0.8 MB/s aggregate, so a 40-minute video is ~60–90 MB (144p) and takes minutes regardless of app-side tuning. `--concurrent-fragments` helps single-connection throttling; parallel video+audio helps per-connection throttling.
 - A first `/api/info` still runs a full extraction (~7 s here); only follow-up calls within the 10 min TTL are instant. Rapid repeated *uncached* `/api/info` calls get throttled and can 504 at the 30s info timeout — cool down before treating as a regression.
 - Failed attempts each pay their own extraction cost (a few seconds), so a fully-blocked download can spend ~30-40 s trying 5-7 sources before reporting 502.
 - Transcripts: `--sub-langs en` only; the any-language fallback exists only as comments; `isAuto` is hardcoded `true` (`server/services/transcript.js`).

@@ -1,5 +1,5 @@
 // Grab a Clip — frontend logic
-import { isYouTubeUrl, extractVideoId } from "/shared/validator.js";
+import { isYouTubeUrl, extractVideoId, normalizeYouTubeUrl } from "/shared/validator.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -167,6 +167,11 @@ async function getVideo() {
     return;
   }
 
+  // The server always works with the canonical URL (status entries, de-dupe).
+  // Normalise here too, otherwise progress polling can never match the job
+  // (youtu.be links, mobile links, &t=/&list= parameters, ...).
+  const normalizedUrl = normalizeYouTubeUrl(url) || url;
+
   setStatus(statusEl, "Fetching video information…", "loading");
   getVideoBtn.disabled = true;
   const label = getVideoBtn.querySelector(".btn-label");
@@ -180,12 +185,12 @@ async function getVideo() {
     const res = await fetch("/api/info", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url: normalizedUrl }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Failed to retrieve video information.");
 
-    currentUrl = url;
+    currentUrl = normalizedUrl;
     currentInfo = data;
 
     vTitleEl.textContent = data.title || "Untitled";
@@ -445,15 +450,32 @@ function saveBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
-function startPhasePolling(type, url, statusTarget, progressEl) {
+function formatEta(seconds) {
+  const total = Math.max(0, Math.round(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function startPhasePolling(type, url, statusTarget, progressEl, estimatedBytes = null) {
   stopPhasePolling(type);
   const state = downloads[type];
+  const wantedId = extractVideoId(url);
+  let lastPct = null;
+  let lastAt = Date.now();
+
   state.poll = setInterval(async () => {
     try {
       const res = await fetch("/api/downloads/status");
       if (!res.ok) return;
       const data = await res.json();
-      const entry = (data.downloads || []).find((d) => d.type === type && d.url === url);
+      // Match on the canonical URL, falling back to the video id so the job is
+      // found even if the page ever holds a different URL shape.
+      const entry = (data.downloads || []).find(
+        (d) => d.type === type && (d.url === url || (wantedId && extractVideoId(d.url) === wantedId))
+      );
       if (!entry) return;
       if (receivedBytes[type]) return; // byte progress has taken over
       if (entry.phase === "failed") {
@@ -469,7 +491,28 @@ function startPhasePolling(type, url, statusTarget, progressEl) {
           showProgress(progressEl);
           setProgressPercent(progressEl, pct);
         }
-        setStatus(statusTarget, detail, "loading");
+
+        // Speed / ETA from progress deltas (size estimate comes from the plan).
+        let meta = "";
+        const now = Date.now();
+        if (pct > 0 && estimatedBytes && lastPct != null && pct > lastPct) {
+          const dt = (now - lastAt) / 1000;
+          if (dt > 0.3) {
+            const speed = (((pct - lastPct) / 100) * estimatedBytes) / dt;
+            if (speed > 0) {
+              meta = ` · ${formatBytesProgress(speed)}/s`;
+              const remaining = (((100 - pct) / 100) * estimatedBytes) / speed;
+              if (remaining > 1 && remaining < 7200) meta += ` · ~${formatEta(remaining)} left`;
+            }
+            lastPct = pct;
+            lastAt = now;
+          }
+        } else if (pct > 0 && lastPct == null) {
+          lastPct = pct;
+          lastAt = now;
+        }
+
+        setStatus(statusTarget, `${detail}${meta}`, "loading");
       } else {
         setStatus(statusTarget, PHASE_LABELS[entry.phase] || entry.phase, "loading");
       }
@@ -535,7 +578,8 @@ async function downloadVideo() {
   showIndeterminateProgress(videoProgressEl);
   receivedBytes.video = 0;
   setStatus(downloadStatusEl, "Starting download…", "loading");
-  startPhasePolling("video", currentUrl, downloadStatusEl, videoProgressEl);
+  const videoPlan = (currentInfo?.formats || []).find((f) => f.height === selectedHeight);
+  startPhasePolling("video", currentUrl, downloadStatusEl, videoProgressEl, videoPlan?.estimatedSize || null);
 
   try {
     const { blob, filename } = await downloadWithProgress(

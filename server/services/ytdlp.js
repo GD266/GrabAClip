@@ -2,6 +2,8 @@ import { spawn, execSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { isYouTubeUrl, normalizeYouTubeUrl } from "../utils/validation.js";
 
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
@@ -37,6 +39,11 @@ const YTDLP_JOB_FLAGS = [
   "ejs:github",
   "--no-warnings",
   "--newline",
+  // Pull HLS/DASH fragments in parallel: single YouTube connections are
+  // bandwidth-throttled, and multi-fragment downloads are much faster for
+  // long videos. Ignored for single-file (progressive/https) formats.
+  "--concurrent-fragments",
+  "8",
   "--progress-template",
   "download:GACDL %(progress._percent_str)s",
   "--retries",
@@ -337,6 +344,8 @@ export function buildVideoFormats(rawFormats, duration = null) {
           vcodec: videoOnly.vcodec,
           acodec: bestAudio.acodec || "aac",
           fps: videoOnly.fps || null,
+          videoSize: vSize,
+          audioSize: aSize,
           estimatedSize: vSize && aSize ? vSize + aSize : vSize || aSize || null,
         };
       }
@@ -640,6 +649,16 @@ export function buildVideoAttempts({ plan = null, height = null, formatId = null
 
   // Retry the preferred source once with a fresh extraction before falling
   // back: media URLs are time-limited, so a new one often just works.
+  if (plan?.kind === "merge" && plan.formatIds?.length === 2) {
+    const [videoId, audioId] = plan.formatIds;
+    const primary = attempts[0];
+    if (primary) primary.merge = { videoSelector: videoId, audioSelector: audioId };
+    const alternate = attempts[1];
+    if (alternate && alternate.selector.startsWith(`${videoId}+`)) {
+      alternate.merge = { videoSelector: videoId, audioSelector: "bestaudio[ext=m4a]/bestaudio" };
+    }
+  }
+
   if (attempts.length > 0) {
     attempts.splice(1, 0, { ...attempts[0], note: "Source was blocked — retrying with fresh links…", delayMs: 1200 });
   }
@@ -808,6 +827,211 @@ export function startAudioDownload(rawUrl, options = {}) {
   args.push("-o", path.join(tmpDir, "audio.%(ext)s"), url);
 
   return { proc: spawnJob(args), tmpDir, selector, outputExt: audioFormat, preferredExts: [audioFormat] };
+}
+
+/** Find a completed stream file produced by yt-dlp (video.* / audio.*). */
+function findPartFile(tmpDir, prefix) {
+  try {
+    const names = fs
+      .readdirSync(tmpDir)
+      .filter((name) => name.startsWith(`${prefix}.`) && !/\.(part|ytdl|temp|tmp)$/i.test(name));
+    for (const name of names) {
+      const filePath = path.join(tmpDir, name);
+      const stat = fs.statSync(filePath);
+      if (stat.isFile() && stat.size > 0) return filePath;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Download a video-only stream and its audio-only stream **in parallel** and
+ * merge them locally with ffmpeg.
+ *
+ * yt-dlp downloads the formats of a merged selection one after another, and
+ * YouTube throttles each connection independently: on long videos the audio
+ * track (a few MB) can take as long as the video. Running both downloaders at
+ * the same time removes that idle tail, so the download finishes in roughly
+ * max(video, audio) instead of video + audio.
+ *
+ * The returned `proc` multiplexes both downloaders + the ffmpeg merge into the
+ * single event surface `runMediaJob` expects.
+ */
+export function startMergeDownload(rawUrl, options = {}) {
+  const { videoSelector, audioSelector, extractorArgs = null, videoSize = null, audioSize = null } = options;
+
+  if (!isYouTubeUrl(rawUrl)) {
+    const err = new Error("Invalid YouTube URL");
+    err.status = 400;
+    throw err;
+  }
+  if (!videoSelector || !audioSelector) {
+    const err = new Error("Missing download selectors");
+    err.status = 500;
+    throw err;
+  }
+
+  const url = normalizeYouTubeUrl(rawUrl);
+  const tmpDir = makeJobDir();
+  const ffmpegBin = process.env.FFMPEG_BIN || "ffmpeg";
+  const baseFlags = [...YTDLP_JOB_FLAGS, ...extractorArgFlags(extractorArgs), "--socket-timeout", "20"];
+
+  const videoProc = spawnJob([...baseFlags, "-f", videoSelector, "-o", path.join(tmpDir, "video.%(ext)s"), url]);
+  const audioProc = spawnJob([...baseFlags, "-f", audioSelector, "-o", path.join(tmpDir, "audio.%(ext)s"), url]);
+  const children = [videoProc, audioProc];
+
+  const emitter = new EventEmitter();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+
+  let done = false;
+  let aborted = false;
+  let merger = null;
+  let stderrText = "";
+
+  const proc = {
+    pid: 0,
+    killed: false,
+    stdout,
+    stderr,
+    on: (...args) => emitter.on(...args),
+    once: (...args) => emitter.once(...args),
+    removeListener: (...args) => emitter.removeListener(...args),
+    kill() {
+      if (proc.killed) return;
+      proc.killed = true;
+      aborted = true;
+      for (const child of children) killProcessTree(child);
+      if (merger) killProcessTree(merger);
+    },
+  };
+
+  const capture = (chunk) => {
+    stderrText += chunk.toString("utf8");
+    if (stderrText.length > 8192) stderrText = stderrText.slice(-8192);
+  };
+
+  const finish = (code) => {
+    if (done) return;
+    done = true;
+    try {
+      if (stderrText) stderr.write(stderrText);
+    } catch {}
+    // Let the data events flush before the close event reaches the runner.
+    setImmediate(() => {
+      try { stdout.end(); stderr.end(); } catch {}
+      emitter.emit("close", code);
+    });
+  };
+
+  const fail = (code, message = "") => {
+    if (done) return;
+    if (message) stderrText += `\n${message}`;
+    for (const child of children) killProcessTree(child);
+    if (merger) killProcessTree(merger);
+    finish(code || 1);
+  };
+
+  // Progress: combine both downloads, weighted by their estimated sizes.
+  const vWeight = Number(videoSize) || 0;
+  const aWeight = Number(audioSize) || 0;
+  const videoShare = vWeight + aWeight > 0 ? vWeight / (vWeight + aWeight) : 0.9;
+  let videoPct = 0;
+  let audioPct = 0;
+  let lastEmitAt = 0;
+
+  const emitProgress = () => {
+    if (done) return;
+    const now = Date.now();
+    if (now - lastEmitAt < 100) return;
+    lastEmitAt = now;
+    // Cap below 99.9 so the parser does not treat it as the HLS manifest line;
+    // the final 100% is reported by the route when the file is ready.
+    const combined = Math.min(99.4, videoPct * videoShare + audioPct * (1 - videoShare));
+    stdout.write(`GACDL ${combined.toFixed(1)}%\n`);
+  };
+
+  const videoParser = createJobOutputParser({ onProgress: (pct) => { videoPct = pct; emitProgress(); } });
+  const audioParser = createJobOutputParser({ onProgress: (pct) => { audioPct = pct; emitProgress(); } });
+  videoProc.stdout.on("data", videoParser);
+  audioProc.stdout.on("data", audioParser);
+  videoProc.stdout.on("error", () => {});
+  audioProc.stdout.on("error", () => {});
+  videoProc.stderr.on("data", capture);
+  audioProc.stderr.on("data", capture);
+  videoProc.stderr.on("error", () => {});
+  audioProc.stderr.on("error", () => {});
+
+  const startMerge = () => {
+    if (done) return;
+    const videoPath = findPartFile(tmpDir, "video");
+    const audioPath = findPartFile(tmpDir, "audio");
+    if (!videoPath || !audioPath) {
+      return fail(1, "ERROR: download completed but the video/audio streams are missing");
+    }
+
+    stdout.write("[Merger] Merging video and audio streams…\n");
+    const outPath = path.join(tmpDir, "media.mp4");
+    const args = [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-i", videoPath, "-i", audioPath,
+      "-map", "0:v:0", "-map", "1:a:0",
+      "-c", "copy", "-movflags", "+faststart",
+      outPath,
+    ];
+
+    merger = spawn(ffmpegBin, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    const timer = setTimeout(() => {
+      try { merger.kill("SIGKILL"); } catch {}
+    }, 5 * 60 * 1000);
+
+    merger.stderr.on("data", capture);
+    merger.stderr.on("error", () => {});
+    merger.on("error", (err) => {
+      clearTimeout(timer);
+      capture(Buffer.from(`ffmpeg: ${err.message || err}`));
+      fail(1);
+    });
+    merger.on("close", (code) => {
+      clearTimeout(timer);
+      if (done) return;
+      let ok = false;
+      try {
+        const stat = fs.statSync(outPath);
+        ok = code === 0 && stat.isFile() && stat.size > 0;
+      } catch {}
+      if (!ok) return fail(code || 1, "ffmpeg could not merge the downloaded streams");
+
+      // The merged file is the only output the runner should find.
+      for (const part of [videoPath, audioPath]) {
+        try { fs.rmSync(part, { force: true }); } catch {}
+      }
+      finish(0);
+    });
+  };
+
+  let pending = children.length;
+  const onChildClose = (code) => {
+    if (done) return;
+    if (aborted) return finish(1);
+    if (code !== 0) return fail(code);
+
+    pending -= 1;
+    if (pending === 0) startMerge();
+  };
+
+  videoProc.on("close", onChildClose);
+  audioProc.on("close", onChildClose);
+  videoProc.on("error", (err) => {
+    capture(Buffer.from(String(err && err.message ? err.message : err)));
+    fail(1);
+  });
+  audioProc.on("error", (err) => {
+    capture(Buffer.from(String(err && err.message ? err.message : err)));
+    fail(1);
+  });
+
+  return { proc, tmpDir, selector: `${videoSelector}+${audioSelector}`, preferredExts: ["mp4"] };
 }
 
 /**
