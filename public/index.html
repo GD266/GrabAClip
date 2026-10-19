@@ -134,6 +134,14 @@
             <div id="qualityGrid" class="option-grid" role="radiogroup" aria-label="Video quality"></div>
             <p id="videoSourceNote" class="option-note"></p>
 
+            <label class="size-toggle" for="smallFileToggle">
+              <input type="checkbox" id="smallFileToggle" checked />
+              <span class="size-toggle-body">
+                <span class="size-toggle-title">Smaller file</span>
+                <span class="size-toggle-note">AV1/VP9 video — about half the size. Uncheck for H.264, which plays on older players.</span>
+              </span>
+            </label>
+
             <div class="panel-actions">
               <button id="downloadBtn" class="btn btn-primary">Download video</button>
               <button id="cancelVideoBtn" class="btn btn-ghost cancel-btn hidden">Cancel</button>

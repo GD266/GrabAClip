@@ -32,7 +32,9 @@ router.post("/", async (req, res) => {
       viewCount: info.viewCount,
       likeCount: info.likeCount,
       description: info.description,
+      // Size-optimised plans (AV1/VP9) plus the H.264 compatibility set.
       formats: info.formats,
+      formatsCompatible: info.formatsCompatible,
       audioFormats: info.audioFormats,
       audioSource: info.audioSource,
     });

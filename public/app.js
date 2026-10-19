@@ -34,6 +34,7 @@ const downloadBtn = $("downloadBtn");
 const cancelVideoBtn = $("cancelVideoBtn");
 const videoProgressEl = $("videoProgress");
 const downloadStatusEl = $("downloadStatus");
+const smallFileToggle = $("smallFileToggle");
 
 // Audio panel
 const audioOptionsEl = $("audioOptions");
@@ -222,7 +223,7 @@ async function getVideo() {
       thumbFallbackEl.classList.remove("hidden");
     }
 
-    renderVideoOptions(data.formats || []);
+    renderVideoOptions(videoFormatsForUi());
     renderAudioOptions(data.audioFormats || [], data.audioSource || null);
 
     // Reset download UI for the new video
@@ -266,6 +267,27 @@ function sourceLabel(plan) {
   return "Single file";
 }
 
+/**
+ * Plan set for the current size preference: the server returns size-optimised
+ * plans (AV1/VP9) as `formats` and H.264 plans as `formatsCompatible`.
+ */
+function videoFormatsForUi() {
+  const info = currentInfo;
+  if (!info) return [];
+  const sizePlans = Array.isArray(info.formats) ? info.formats : [];
+  const compatPlans = Array.isArray(info.formatsCompatible) ? info.formatsCompatible : [];
+  if (smallFileToggle && !smallFileToggle.checked) return compatPlans.length ? compatPlans : sizePlans;
+  return sizePlans.length ? sizePlans : compatPlans;
+}
+
+function refreshVideoOptions() {
+  if (!currentInfo || downloads.video.active) return;
+  const previous = selectedHeight;
+  const formats = videoFormatsForUi();
+  renderVideoOptions(formats);
+  if (previous != null && formats.some((f) => f.height === previous)) selectVideoOption(previous);
+}
+
 function renderVideoOptions(formats) {
   qualityGridEl.innerHTML = "";
   if (!formats.length) {
@@ -294,8 +316,11 @@ function renderVideoOptions(formats) {
 
     const note = document.createElement("span");
     note.className = "opt-note";
-    const size = f.estimatedSize ? formatBytes(f.estimatedSize) : null;
-    note.textContent = size ? `${size} · ${sourceLabel(f)}` : sourceLabel(f);
+    const bits = [];
+    if (f.estimatedSize) bits.push(formatBytes(f.estimatedSize));
+    if (f.codecLabel) bits.push(f.codecLabel);
+    bits.push(sourceLabel(f));
+    note.textContent = bits.filter(Boolean).join(" · ");
 
     btn.append(label, note);
     btn.addEventListener("click", () => selectVideoOption(f.height));
@@ -311,10 +336,11 @@ function selectVideoOption(height) {
     btn.classList.toggle("is-selected", isSelected);
     btn.setAttribute("aria-checked", String(isSelected));
   }
-  const plan = (currentInfo?.formats || []).find((f) => f.height === height);
+  const plan = videoFormatsForUi().find((f) => f.height === height);
   if (plan) {
     const size = plan.estimatedSize ? ` · approx. ${formatBytes(plan.estimatedSize)}` : "";
-    videoSourceNoteEl.textContent = `${plan.label} · ${sourceLabel(plan)} · includes audio${size}`;
+    const codec = plan.codecLabel ? ` · ${plan.codecLabel}` : "";
+    videoSourceNoteEl.textContent = `${plan.label}${codec} · ${sourceLabel(plan)} · includes audio${size}`;
   } else {
     videoSourceNoteEl.textContent = "";
   }
@@ -571,6 +597,9 @@ async function downloadVideo() {
   }
 
   const params = new URLSearchParams({ url: currentUrl, height: String(selectedHeight) });
+  // The default plan set is the smaller AV1/VP9 one; unchecking the box asks
+  // the server for the H.264 plans instead.
+  params.set("codec", smallFileToggle && !smallFileToggle.checked ? "h264" : "small");
   const downloadUrl = `/api/download?${params.toString()}`;
 
   setDownloading("video", true);
@@ -578,7 +607,7 @@ async function downloadVideo() {
   showIndeterminateProgress(videoProgressEl);
   receivedBytes.video = 0;
   setStatus(downloadStatusEl, "Starting download…", "loading");
-  const videoPlan = (currentInfo?.formats || []).find((f) => f.height === selectedHeight);
+  const videoPlan = videoFormatsForUi().find((f) => f.height === selectedHeight);
   startPhasePolling("video", currentUrl, downloadStatusEl, videoProgressEl, videoPlan?.estimatedSize || null);
 
   try {
@@ -760,6 +789,7 @@ tabs.intel.addEventListener("click", () => activateTab("intel"));
 
 downloadBtn.addEventListener("click", downloadVideo);
 downloadAudioBtn.addEventListener("click", downloadAudio);
+if (smallFileToggle) smallFileToggle.addEventListener("change", refreshVideoOptions);
 cancelVideoBtn.addEventListener("click", () => cancelDownload("video"));
 cancelAudioBtn.addEventListener("click", () => cancelDownload("audio"));
 getIntelligenceBtn.addEventListener("click", getIntelligence);

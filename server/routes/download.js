@@ -78,17 +78,28 @@ router.get("/", async (req, res) => {
   //  - explicit height -> matching plan from the info response
   //  - no selection    -> best available plan (<= 1080p)
   //  - legacy formatId -> raw yt-dlp selection
+  // `codec=h264` selects the compatibility plans (H.264); the default is the
+  // size-optimised set (AV1/VP9 sources, about half the size).
+  const preferCompat = req.query.codec === "h264" || req.query.codec === "compat";
+  const planSet = preferCompat
+    ? info.formatsCompatible?.length
+      ? info.formatsCompatible
+      : info.formats
+    : info.formats?.length
+      ? info.formats
+      : info.formatsCompatible || [];
+
   let plan = null;
   if (height != null) {
-    plan = info.formats.find((f) => f.height === height) || null;
+    plan = planSet.find((f) => f.height === height) || null;
     if (!plan) {
-      const available = info.formats.map((f) => f.label).join(", ") || "none";
+      const available = planSet.map((f) => f.label).join(", ") || "none";
       const message = `${height}p is not available for this video. Available qualities: ${available}.`;
       failDownload("video", normalizedUrl, message);
       return res.status(400).json({ error: message });
     }
   } else if (!formatId) {
-    plan = info.formats[0] || null;
+    plan = planSet[0] || null;
   }
 
   // Ordered fallback chain: preferred source -> fresh retry -> safer
@@ -148,6 +159,9 @@ router.get("/", async (req, res) => {
     onProgress: (pct) => setProgressDetail("video", normalizedUrl, pct, `Downloading from YouTube… ${Math.round(pct)}%`),
     onDetail: (text) => setProgressDetail("video", normalizedUrl, null, text),
     signal: jobController.signal,
+    // A video download must always contain audio; the runner verifies the
+    // file and falls back to another source instead of delivering silence.
+    requireAudio: true,
   });
 
   if (clientGone || result.aborted) {

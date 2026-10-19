@@ -46,6 +46,17 @@ const dashVideo240Av1 = {
   fps: 30,
 };
 
+const dashVideo240Vp9 = {
+  format_id: "242",
+  ext: "webm",
+  protocol: "https",
+  vcodec: "vp9",
+  acodec: "none",
+  height: 240,
+  tbr: 100,
+  fps: 30,
+};
+
 const dashAudio140 = {
   format_id: "140",
   ext: "m4a",
@@ -134,10 +145,34 @@ test("buildVideoFormats merges DASH video-only with best audio when no muxed HLS
   assert.equal(plan.acodec, "mp4a.40.2");
 });
 
-test("buildVideoFormats prefers H.264 over AV1 when merging", () => {
+test("buildVideoFormats prefers H.264 over AV1 when merging (compatibility mode)", () => {
   const plans = buildVideoFormats([dashVideo240Av1, dashVideo240, dashAudio140]);
   const plan = plans.find((p) => p.height === 240);
   assert.equal(plan.formatIds[0], "133");
+  assert.equal(plan.codecLabel, "H.264");
+});
+
+test("buildVideoFormats size mode prefers AV1 and reports smaller sizes", () => {
+  const plans = buildVideoFormats([dashVideo240Av1, dashVideo240, dashAudio140], 100, { preferSize: true });
+  const plan = plans.find((p) => p.height === 240);
+  assert.equal(plan.formatIds[0], "394");
+  assert.equal(plan.codecLabel, "AV1");
+  assert.equal(plan.videoSize, 1875000); // 150 kbps * 100 s / 8
+  assert.equal(plan.audioSize, 1600000);
+  assert.equal(plan.estimatedSize, plan.videoSize + plan.audioSize);
+
+  const compat = buildVideoFormats([dashVideo240Av1, dashVideo240, dashAudio140], 100);
+  assert.ok(plan.videoSize < compat.find((p) => p.height === 240).videoSize);
+});
+
+test("buildVideoFormats size mode falls back to VP9, then H.264", () => {
+  const vp9 = buildVideoFormats([dashVideo240Vp9, dashVideo240, dashAudio140], 100, { preferSize: true });
+  assert.equal(vp9[0].formatIds[0], "242");
+  assert.equal(vp9[0].codecLabel, "VP9");
+
+  const h264 = buildVideoFormats([dashVideo240, dashAudio140], 100, { preferSize: true });
+  assert.equal(h264[0].formatIds[0], "133");
+  assert.equal(h264[0].codecLabel, "H.264");
 });
 
 test("buildVideoFormats falls back to progressive formats last", () => {
@@ -292,6 +327,7 @@ test("buildVideoFormats attaches ordered fallback selectors to every plan", () =
     "133+bestaudio[ext=m4a]/133+bestaudio",
     "best[height=240][protocol*=m3u8]",
     "best[height<=240][protocol*=m3u8]/best[height<=240]",
+    "bestvideo[height<=240][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=240][vcodec^=avc1]+bestaudio",
   ]);
 });
 
@@ -316,6 +352,19 @@ test("buildVideoAttempts ends with alternate YouTube player clients", () => {
 test("buildVideoAttempts supports the legacy raw formatId selection", () => {
   const attempts = buildVideoAttempts({ formatId: "137", height: 1080 });
   assert.match(attempts[0].selector, /^137\+/);
+  // Never fall back to the bare video-only id: every selector keeps audio.
+  assert.ok(attempts.every((a) => a.selector !== "137"));
+  assert.ok(attempts.some((a) => /^bestvideo.*\+bestaudio/.test(a.selector)));
+});
+
+test("every video plan's selector chain ends with a video+audio merge", () => {
+  const muxed = buildVideoFormats([hls93, dashAudio140])[0];
+  assert.equal(muxed.kind, "muxed");
+  assert.match(muxed.selectors.at(-1), /^bestvideo.*\+bestaudio/);
+
+  const merge = buildVideoFormats([dashVideo240, dashAudio140])[0];
+  assert.equal(merge.kind, "merge");
+  assert.match(merge.selectors.at(-1), /^bestvideo.*\+bestaudio/);
 });
 
 test("merge plans expose separate video/audio estimates and parallel-download attempts", () => {

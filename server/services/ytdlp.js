@@ -129,6 +129,13 @@ export function classifyYtDlpError(stderr, code) {
         "YouTube blocked this download (HTTP 403) even after retrying several sources. Wait a minute and try again — keeping yt-dlp up to date usually prevents this.",
     };
   }
+  if (lower.includes("no audio stream")) {
+    return {
+      status: 502,
+      message:
+        "Every source for this video came back without audio. Try another quality or wait a minute and retry.",
+    };
+  }
   if (lower.includes("network") || lower.includes("timeout") || lower.includes("http error 429")) {
     return { status: 502, message: "Network error while contacting YouTube. Please try again." };
   }
@@ -264,12 +271,34 @@ function estimateSize(f, duration) {
  * Codec preference for merged downloads: H.264 (avc1) plays everywhere,
  * AV1 (av01) next, then VP9. Within a codec, higher bitrate wins.
  */
-function codecRank(vcodec) {
+/**
+ * Codec preference. Compatibility mode keeps H.264 first (plays everywhere);
+ * size mode prefers AV1, then VP9, which are ~50-70% smaller at the same
+ * resolution (YouTube encodes them much more efficiently than H.264).
+ */
+function codecRank(vcodec, preferSize = false) {
   const v = String(vcodec || "").toLowerCase();
+  const isAv1 = v.startsWith("av01");
+  const isVp9 = v.startsWith("vp09") || v.startsWith("vp9") || v.startsWith("vp8");
+  if (preferSize) {
+    if (isAv1) return 0;
+    if (isVp9) return 1;
+    if (v.startsWith("avc1")) return 2;
+    return 3;
+  }
   if (v.startsWith("avc1")) return 0;
-  if (v.startsWith("av01")) return 1;
-  if (v.startsWith("vp09") || v.startsWith("vp9") || v.startsWith("vp8")) return 2;
+  if (isAv1) return 1;
+  if (isVp9) return 2;
   return 3;
+}
+
+function codecLabel(vcodec) {
+  const v = String(vcodec || "").toLowerCase();
+  if (v.startsWith("av01")) return "AV1";
+  if (v.startsWith("vp09") || v.startsWith("vp9")) return "VP9";
+  if (v.startsWith("avc1")) return "H.264";
+  if (v.startsWith("vp8")) return "VP8";
+  return "Video";
 }
 
 /**
@@ -282,8 +311,11 @@ function codecRank(vcodec) {
  *  - Progressive (plain https, muxed) formats are a last resort: they are the
  *    ones most likely to return HTTP 403.
  */
-export function buildVideoFormats(rawFormats, duration = null) {
+export function buildVideoFormats(rawFormats, duration = null, options = {}) {
   if (!Array.isArray(rawFormats)) return [];
+  // Size mode picks AV1/VP9 sources (much smaller files); the default keeps
+  // H.264 for maximum player compatibility.
+  const preferSize = Boolean(options.preferSize);
 
   const usable = rawFormats.filter(
     (f) =>
@@ -311,45 +343,63 @@ export function buildVideoFormats(rawFormats, duration = null) {
     [...video].map((f) => f.height).filter((h) => h >= 144 && h <= 1080)
   )].sort((a, b) => b - a);
 
+  const muxedPlan = (muxed) => ({
+    kind: "muxed",
+    formatIds: [muxed.format_id],
+    source: "hls",
+    vcodec: muxed.vcodec,
+    acodec: muxed.acodec,
+    fps: muxed.fps || null,
+    estimatedSize: estimateSize(muxed, duration),
+  });
+
+  const mergePlan = (videoOnly) => {
+    const vSize = estimateSize(videoOnly, duration);
+    const aSize = estimateSize(bestAudio, duration);
+    return {
+      kind: "merge",
+      formatIds: [videoOnly.format_id, bestAudio.format_id],
+      source: isHls(videoOnly) ? "hls" : "dash",
+      vcodec: videoOnly.vcodec,
+      acodec: bestAudio.acodec || "aac",
+      fps: videoOnly.fps || null,
+      videoSize: vSize,
+      audioSize: aSize,
+      estimatedSize: vSize && aSize ? vSize + aSize : vSize || aSize || null,
+    };
+  };
+
   const plans = [];
   for (const height of availableHeights) {
     let plan = null;
-
-    const muxed = hlsMuxed
+    const videoCandidates = [...dashVideoOnly, ...hlsVideoOnly].filter((f) => f.height === height);
+    const muxedAtHeight = hlsMuxed
       .filter((f) => f.height === height)
       .sort((a, b) => (b.tbr || b.abr || 0) - (a.tbr || a.abr || 0))[0];
-    if (muxed) {
-      plan = {
-        kind: "muxed",
-        formatIds: [muxed.format_id],
-        source: "hls",
-        vcodec: muxed.vcodec,
-        acodec: muxed.acodec,
-        fps: muxed.fps || null,
-        estimatedSize: estimateSize(muxed, duration),
-      };
+
+    // Size mode: prefer the most efficient codec (AV1 > VP9 > H.264) and its
+    // lowest-bitrate variant, then merge it with the best audio.
+    if (preferSize) {
+      const videoOnly = [...videoCandidates].sort(
+        (a, b) => codecRank(a.vcodec, true) - codecRank(b.vcodec, true) || (a.tbr || 0) - (b.tbr || 0)
+      )[0];
+      if (videoOnly && bestAudio) plan = mergePlan(videoOnly);
     }
 
+    // Compatibility mode: a muxed HLS variant means one download with audio.
+    if (!plan && !preferSize && muxedAtHeight) plan = muxedPlan(muxedAtHeight);
+
     if (!plan) {
-      const videoOnly = [...dashVideoOnly, ...hlsVideoOnly]
-        .filter((f) => f.height === height)
-        .sort((a, b) => codecRank(a.vcodec) - codecRank(b.vcodec) || (b.tbr || 0) - (a.tbr || 0))[0];
-      if (videoOnly && bestAudio) {
-        const vSize = estimateSize(videoOnly, duration);
-        const aSize = estimateSize(bestAudio, duration);
-        plan = {
-          kind: "merge",
-          formatIds: [videoOnly.format_id, bestAudio.format_id],
-          source: isHls(videoOnly) ? "hls" : "dash",
-          vcodec: videoOnly.vcodec,
-          acodec: bestAudio.acodec || "aac",
-          fps: videoOnly.fps || null,
-          videoSize: vSize,
-          audioSize: aSize,
-          estimatedSize: vSize && aSize ? vSize + aSize : vSize || aSize || null,
-        };
-      }
+      const videoOnly = [...videoCandidates].sort(
+        (a, b) =>
+          codecRank(a.vcodec, preferSize) - codecRank(b.vcodec, preferSize) ||
+          (preferSize ? (a.tbr || 0) - (b.tbr || 0) : (b.tbr || 0) - (a.tbr || 0))
+      )[0];
+      if (videoOnly && bestAudio) plan = mergePlan(videoOnly);
     }
+
+    // Fall back to a muxed HLS variant (if we did not already try it).
+    if (!plan && muxedAtHeight) plan = muxedPlan(muxedAtHeight);
 
     if (!plan) {
       const prog = progressive
@@ -373,14 +423,23 @@ export function buildVideoFormats(rawFormats, duration = null) {
     // Ordered yt-dlp selectors for this plan: preferred source first, then
     // progressively safer fallbacks that the retry runner uses when YouTube
     // rejects a source (HTTP 403, stale URL, format unavailable, ...).
+    // Every chain ends with an explicit video+audio merge so a video-only
+    // stream can never be delivered as the final file.
     const exactHls = `best[height=${height}][protocol*=m3u8]`;
     const atMost = `best[height<=${height}][protocol*=m3u8]/best[height<=${height}]`;
+    const audioFallback = `bestvideo[height<=${height}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=${height}][vcodec^=avc1]+bestaudio`;
     let selectors;
     if (plan.kind === "merge") {
       const [vid, aid] = plan.formatIds;
-      selectors = [`${vid}+${aid}`, `${vid}+bestaudio[ext=m4a]/${vid}+bestaudio`, exactHls, atMost];
+      selectors = [
+        `${vid}+${aid}`,
+        `${vid}+bestaudio[ext=m4a]/${vid}+bestaudio`,
+        exactHls,
+        atMost,
+        audioFallback,
+      ];
     } else {
-      selectors = [plan.formatIds[0], exactHls, atMost];
+      selectors = [plan.formatIds[0], exactHls, atMost, audioFallback];
     }
 
     plans.push({
@@ -389,6 +448,7 @@ export function buildVideoFormats(rawFormats, duration = null) {
       displayLabel: `${height}p`,
       ext: "mp4",
       hasAudio: true,
+      codecLabel: codecLabel(plan.vcodec),
       formatId: plan.formatIds.join("+"),
       ...plan,
       selectors,
@@ -525,7 +585,11 @@ export async function getVideoInfo(rawUrl, options = {}) {
     uploadDate = String(data.release_date);
   }
 
-  const formats = buildVideoFormats(data.formats, duration);
+  // Two plan sets from one extraction: `formats` is size-optimised (AV1/VP9
+  // sources are roughly half the size of H.264) while `formatsCompatible`
+  // stays on H.264 for maximum player compatibility.
+  const formats = buildVideoFormats(data.formats, duration, { preferSize: true });
+  const formatsCompatible = buildVideoFormats(data.formats, duration);
   const audioFormats = buildAudioFormats();
   const audioSource = pickAudioSource(data.formats);
 
@@ -544,6 +608,7 @@ export async function getVideoInfo(rawUrl, options = {}) {
     uploadDate,
     uploadDateFormatted,
     formats,
+    formatsCompatible,
     audioFormats,
     audioSource,
     // Internal: used by the audio route to pick the extraction source.
@@ -638,9 +703,13 @@ export function buildVideoAttempts({ plan = null, height = null, formatId = null
   if (plan?.selectors?.length) {
     for (const selector of plan.selectors) add(selector, { note: "Starting download…" });
   } else if (formatId) {
-    // Legacy callers pass a raw yt-dlp format id.
-    add(`${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio/${formatId}`, { note: "Starting download…" });
+    // Legacy callers pass a raw yt-dlp format id. Always pair it with audio:
+    // a bare video-only format id would produce a silent file.
+    add(`${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio`, { note: "Starting download…" });
     add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]`, { note: "Trying an alternative source…" });
+    add(`bestvideo[height<=${h}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=${h}][vcodec^=avc1]+bestaudio`, {
+      note: "Trying a safe video+audio source…",
+    });
   } else {
     add(`bestvideo[height<=${h}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}][protocol*=m3u8]/best[height<=${h}]`, {
       note: "Starting download…",
@@ -1035,6 +1104,43 @@ export function startMergeDownload(rawUrl, options = {}) {
 }
 
 /**
+ * Check that a downloaded file contains an audio stream.
+ *
+ * Format metadata can claim an audio codec while the selected source is
+ * video-only (or a partial download can lose the track); the video route must
+ * never hand the user a silent file. When ffprobe is unavailable the check is
+ * skipped rather than blocking downloads.
+ */
+function hasAudioStream(filePath) {
+  return new Promise((resolve) => {
+    const ffprobeBin = process.env.FFPROBE_BIN || "ffprobe";
+    let output = "";
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
+    let probe;
+    try {
+      probe = spawn(
+        ffprobeBin,
+        ["-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", filePath],
+        { windowsHide: true }
+      );
+    } catch {
+      return done(true);
+    }
+
+    probe.stdout.on("data", (chunk) => { output += chunk.toString("utf8"); });
+    probe.stderr.on("data", () => {});
+    probe.on("error", () => done(true));
+    probe.on("close", (code) => done(code === 0 && /audio/i.test(output)));
+  });
+}
+
+/**
  * Run a media job with ordered fallback attempts.
  *
  * `startJob(attempt)` must return `{ proc, tmpDir, preferredExts }`.
@@ -1045,7 +1151,7 @@ export function startMergeDownload(rawUrl, options = {}) {
  *   { ok: false, aborted: true }
  *   { ok: false, stderr, code, fatal }
  */
-export function runMediaJob({ attempts, startJob, onProgress, onDetail, signal }) {
+export function runMediaJob({ attempts, startJob, onProgress, onDetail, signal, requireAudio = false }) {
   return new Promise((resolve) => {
     const total = attempts.length;
     let index = 0;
@@ -1140,12 +1246,31 @@ export function runMediaJob({ attempts, startJob, onProgress, onDetail, signal }
 
             if (code === 0) {
               const output = findOutputFile(job.tmpDir, job.preferredExts);
-              if (output) {
+              if (!output) {
+                lastStderr = lastStderr || "Download completed but no media file was produced.";
+                cleanupJobDir(job.tmpDir);
+                return next();
+              }
+              if (!requireAudio) {
                 return finish({ ok: true, output, job, attemptsUsed: attemptNumber });
               }
-              lastStderr = lastStderr || "Download completed but no media file was produced.";
-              cleanupJobDir(job.tmpDir);
-              return next();
+
+              // Never deliver a silent video: verify the audio track and fall
+              // back to the next source if it is missing.
+              hasAudioStream(output.path).then((hasAudio) => {
+                if (cancelled) {
+                  cleanupJobDir(job.tmpDir);
+                  return finish({ ok: false, aborted: true });
+                }
+                if (hasAudio) {
+                  return finish({ ok: true, output, job, attemptsUsed: attemptNumber });
+                }
+                lastStderr = "ERROR: the downloaded video has no audio stream";
+                console.log(`[ytdlp] attempt ${attemptNumber}/${total} produced a video without audio; trying next source`);
+                cleanupJobDir(job.tmpDir);
+                next();
+              });
+              return;
             }
 
             if (isFatalDownloadError(attemptStderr)) {
