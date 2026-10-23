@@ -1,9 +1,9 @@
 /**
- * Short-lived cache for processed video info.
+ * Short-lived cache for processed media info.
  *
  * A download click should not have to run yt-dlp extraction again: the
  * frontend has already fetched /api/info right before, so re-using that
- * result removes ~5-10s of latency (and an extra YouTube request) from
+ * result removes seconds of latency (and an extra platform request) from
  * every download.
  *
  * Concurrent requests for the same URL share one in-flight fetch.

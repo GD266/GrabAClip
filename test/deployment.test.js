@@ -19,6 +19,12 @@ test("the validator is served from public/ so static hosts keep the import worki
   assert.match(validator, /export function extractVideoId/);
   assert.match(validator, /export function isYouTubeUrl/);
   assert.match(validator, /export function normalizeYouTubeUrl/);
+  assert.match(validator, /export function detectPlatform/);
+  assert.match(validator, /export function normalizeMediaUrl/);
+  assert.match(validator, /export function extractMediaId/);
+
+  assert.match(app, /normalizeMediaUrl/);
+  assert.match(app, /isSupportedMediaUrl/);
 });
 
 test("index.html loads config.js before the app module", () => {

@@ -18,7 +18,7 @@ export function startDownload(type, url) {
     startedAt: Date.now(),
     lastUpdate: Date.now(),
     error: null,
-    // 0-100 progress of the media fetch from YouTube (YouTube -> server).
+    // 0-100 progress of the media fetch from the source platform (platform -> server).
     progress: 0,
     // Human readable detail for the current phase (shown in the UI).
     detail: null,
@@ -39,7 +39,7 @@ export function setPhase(type, url, phase, extra = {}) {
 
 /**
  * Update progress (0-100) and/or detail text for an active download.
- * Called while yt-dlp pulls media from YouTube.
+ * Called while yt-dlp pulls media from the source platform.
  */
 export function setProgressDetail(type, url, progress, detail) {
   const key = `${type}:${url}`;

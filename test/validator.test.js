@@ -6,6 +6,14 @@ import {
   isValidVideoId,
   isYouTubeUrl,
   normalizeYouTubeUrl,
+  detectPlatform,
+  isSupportedMediaUrl,
+  normalizeMediaUrl,
+  extractMediaId,
+  isXUrl,
+  normalizeXUrl,
+  isInstagramUrl,
+  normalizeInstagramUrl,
 } from "../public/shared/validator.js";
 
 import {
@@ -61,6 +69,94 @@ test("normalizeYouTubeUrl produces the canonical watch URL", () => {
 });
 
 // ---------------------------------------------------------------------------
+// X / Twitter
+// ---------------------------------------------------------------------------
+
+test("normalizeXUrl canonicalises status links and keeps the video index", () => {
+  assert.equal(
+    normalizeXUrl("https://twitter.com/NASA/status/1234567890?lang=en"),
+    "https://x.com/NASA/status/1234567890/video/1"
+  );
+  assert.equal(
+    normalizeXUrl("https://x.com/NASA/status/1234567890/video/2"),
+    "https://x.com/NASA/status/1234567890/video/2"
+  );
+  assert.equal(
+    normalizeXUrl("https://mobile.twitter.com/i/web/status/1234567890"),
+    "https://x.com/i/web/status/1234567890/video/1"
+  );
+  assert.equal(
+    normalizeMediaUrl("https://x.com/NASA/status/1234567890"),
+    "https://x.com/NASA/status/1234567890/video/1"
+  );
+  assert.equal(normalizeXUrl("https://x.com/NASA"), null);
+  assert.equal(normalizeXUrl("https://x.com.evil.example/NASA/status/1234567890"), null);
+  assert.equal(normalizeXUrl("https://x.com/NASA/status/not-a-number"), null);
+});
+
+// ---------------------------------------------------------------------------
+// Instagram
+// ---------------------------------------------------------------------------
+
+test("normalizeInstagramUrl handles reels, posts, TV and username prefixes", () => {
+  assert.equal(
+    normalizeInstagramUrl("https://www.instagram.com/reel/CDUMkliABpa/?igsh=x"),
+    "https://www.instagram.com/reel/CDUMkliABpa/"
+  );
+  assert.equal(
+    normalizeInstagramUrl("https://instagram.com/reels/CDUMkliABpa/"),
+    "https://www.instagram.com/reel/CDUMkliABpa/"
+  );
+  assert.equal(
+    normalizeInstagramUrl("https://www.instagram.com/someuser/reel/CDUMkliABpa/"),
+    "https://www.instagram.com/reel/CDUMkliABpa/"
+  );
+  assert.equal(
+    normalizeInstagramUrl("https://www.instagram.com/p/BQ0eAlwhDrw/"),
+    "https://www.instagram.com/p/BQ0eAlwhDrw/"
+  );
+  assert.equal(
+    normalizeInstagramUrl("https://www.instagram.com/tv/BkfuX9UB-eK/"),
+    "https://www.instagram.com/tv/BkfuX9UB-eK/"
+  );
+  assert.equal(normalizeInstagramUrl("https://www.instagram.com/someuser/"), null);
+  assert.equal(normalizeInstagramUrl("https://www.instagram.com/stories/someuser/123/"), null);
+  assert.equal(normalizeInstagramUrl("https://www.instagram.com/reels/audio/1234567890/"), null);
+  assert.equal(normalizeInstagramUrl("https://instagram.com.evil.example/reel/CDUMkliABpa/"), null);
+});
+
+// ---------------------------------------------------------------------------
+// Universal helpers
+// ---------------------------------------------------------------------------
+
+test("detectPlatform and isSupportedMediaUrl cover all three platforms", () => {
+  assert.equal(detectPlatform("https://youtu.be/dQw4w9WgXcQ"), "youtube");
+  assert.equal(detectPlatform("https://x.com/NASA/status/1234567890"), "x");
+  assert.equal(detectPlatform("https://www.instagram.com/reel/CDUMkliABpa/"), "instagram");
+  assert.equal(detectPlatform("https://vimeo.com/12345"), null);
+  assert.equal(detectPlatform("javascript:alert(1)"), null);
+
+  assert.equal(isSupportedMediaUrl("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), true);
+  assert.equal(isSupportedMediaUrl("https://x.com/NASA/status/1234567890"), true);
+  assert.equal(isSupportedMediaUrl("https://www.instagram.com/p/BQ0eAlwhDrw/"), true);
+  assert.equal(isSupportedMediaUrl("https://vimeo.com/12345"), false);
+});
+
+test("extractMediaId returns a stable id per platform", () => {
+  assert.equal(extractMediaId("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+  assert.equal(extractMediaId("https://x.com/NASA/status/1234567890/video/2"), "1234567890");
+  assert.equal(extractMediaId("https://www.instagram.com/reel/CDUMkliABpa/"), "CDUMkliABpa");
+  assert.equal(extractMediaId("https://vimeo.com/12345"), null);
+});
+
+test("isXUrl and isInstagramUrl reject lookalike and profile URLs", () => {
+  assert.equal(isXUrl("https://x.com/NASA/status/1234567890"), true);
+  assert.equal(isXUrl("https://x.com/NASA"), false);
+  assert.equal(isInstagramUrl("https://www.instagram.com/reel/CDUMkliABpa/"), true);
+  assert.equal(isInstagramUrl("https://www.instagram.com/someuser/"), false);
+});
+
+// ---------------------------------------------------------------------------
 // validateDownloadQuery
 // ---------------------------------------------------------------------------
 
@@ -87,8 +183,19 @@ test("validateDownloadQuery accepts a height with a p suffix and all UI steps", 
   }
 });
 
+test("validateDownloadQuery accepts source-specific quality heights", () => {
+  for (const [url, input, expected] of [
+    ["https://x.com/NASA/status/1234567890", "270", 270],
+    ["https://www.instagram.com/reel/CDUMkliABpa/", "504p", 504],
+  ]) {
+    const r = validateDownloadQuery({ url, height: input });
+    assert.equal(r.valid, true, `height ${input} should be valid`);
+    assert.equal(r.height, expected);
+  }
+});
+
 test("validateDownloadQuery rejects unsupported heights", () => {
-  for (const bad of ["999", "2160", "abc", "-1"]) {
+  for (const bad of ["100", "1081", "2160", "abc", "-1"]) {
     const r = validateDownloadQuery({ url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ", height: bad });
     assert.equal(r.valid, false, `height ${bad} should be invalid`);
   }
@@ -101,7 +208,24 @@ test("validateDownloadQuery accepts a legacy formatId", () => {
   assert.equal(r.height, null);
 });
 
-test("validateDownloadQuery requires a valid YouTube URL", () => {
+test("validateDownloadQuery validates every supported platform", () => {
+  const x = validateDownloadQuery({ url: "https://x.com/NASA/status/1234567890", height: "720" });
+  assert.equal(x.valid, true);
+  assert.equal(x.platform, "x");
+  assert.equal(x.normalizedUrl, "https://x.com/NASA/status/1234567890/video/1");
+
+  const instagram = validateDownloadQuery({
+    url: "https://www.instagram.com/reel/CDUMkliABpa/",
+    height: "504",
+  });
+  assert.equal(instagram.valid, true);
+  assert.equal(instagram.platform, "instagram");
+  assert.equal(instagram.normalizedUrl, "https://www.instagram.com/reel/CDUMkliABpa/");
+
+  assert.equal(validateDownloadQuery({ url: "https://vimeo.com/12345" }).valid, false);
+});
+
+test("validateDownloadQuery requires a valid supported URL", () => {
   assert.equal(validateDownloadQuery({}).valid, false);
   assert.equal(validateDownloadQuery({ url: "" }).valid, false);
   assert.equal(validateDownloadQuery({ url: "https://vimeo.com/12345" }).valid, false);
@@ -110,10 +234,22 @@ test("validateDownloadQuery requires a valid YouTube URL", () => {
 test("validateInfoRequest mirrors the download URL validation", () => {
   const ok = validateInfoRequest({ url: "https://youtu.be/dQw4w9WgXcQ" });
   assert.equal(ok.valid, true);
+  assert.equal(ok.platform, "youtube");
   assert.equal(ok.videoId, "dQw4w9WgXcQ");
+
+  const x = validateInfoRequest({ url: "https://twitter.com/NASA/status/1234567890" });
+  assert.equal(x.valid, true);
+  assert.equal(x.platform, "x");
+  assert.equal(x.normalizedUrl, "https://x.com/NASA/status/1234567890/video/1");
+
+  const instagram = validateInfoRequest({ url: "https://www.instagram.com/p/BQ0eAlwhDrw/" });
+  assert.equal(instagram.valid, true);
+  assert.equal(instagram.platform, "instagram");
+  assert.equal(instagram.videoId, "BQ0eAlwhDrw");
 
   assert.equal(validateInfoRequest({}).valid, false);
   assert.equal(validateInfoRequest({ url: "nope" }).valid, false);
+  assert.equal(validateInfoRequest({ url: "https://vimeo.com/12345" }).valid, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -145,7 +281,9 @@ test("sanitizeAsciiFilename keeps the Content-Disposition quoted string safe", (
 test("isValidFormatId allows typical yt-dlp ids only", () => {
   assert.equal(isValidFormatId("137"), true);
   assert.equal(isValidFormatId("hls-123_4"), true);
+  assert.equal(isValidFormatId("dash-1254645688899587a"), true);
   assert.equal(isValidFormatId("137+140"), false);
   assert.equal(isValidFormatId("rm -rf /"), false);
   assert.equal(isValidFormatId(""), false);
+  assert.equal(isValidFormatId("a".repeat(65)), false);
 });

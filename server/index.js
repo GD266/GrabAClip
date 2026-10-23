@@ -56,7 +56,7 @@ app.use((req, res, next) => {
 
 // Health
 // ytDlpVersion is informational: keep yt-dlp up to date (see AGENTS.md),
-// stale versions get their media URLs rejected by YouTube (HTTP 403).
+// stale versions get their YouTube media URLs rejected (HTTP 403).
 app.get("/api/health", async (req, res) => {
   const version = await getYtDlpVersion();
   const payload = { status: "ok", ytDlp: process.env.YTDLP_BIN || "yt-dlp", ytDlpVersion: version };

@@ -20,6 +20,7 @@ router.post("/", async (req, res) => {
 
     // Return expanded fields (optional fields may be null, but do not fail)
     return res.json({
+      platform: info.platform,
       videoId: info.videoId,
       title: info.title,
       thumbnail: info.thumbnail,

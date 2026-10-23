@@ -115,16 +115,18 @@ Multiple origins can be comma-separated. The download routes expose
 `Content-Disposition`/`Content-Length`, so filenames and progress work
 cross-origin.
 
-## Videos that require sign-in (YouTube cookies)
+## Posts that require sign-in (cookies)
 
 Cloud/datacenter IPs (Render, Railway, Fly, VPS) are routinely challenged by
 YouTube with **"Sign in to confirm you're not a bot"** on some videos while
-others work fine. There is no cookie-less workaround for those videos; the
-backend supports cookies from a signed-in YouTube session:
+others work fine. X/Twitter and Instagram can also require a signed-in session
+or rate-limit anonymous requests. The backend passes one cookie file to all
+info/download calls, so you can include several sites in the same cookie export.
 
-1. Sign in to YouTube in a desktop browser.
-2. Export a **Netscape-format** `cookies.txt` for `youtube.com` (e.g. with a
-   "Get cookies.txt LOCALLY" style browser extension).
+1. Sign in to the platform in a desktop browser.
+2. Export a **Netscape-format** `cookies.txt` for `youtube.com`, `x.com` /
+   `twitter.com`, or `instagram.com` (e.g. with a "Get cookies.txt LOCALLY"
+   style browser extension). Multiple domains can live in one file.
 3. Base64-encode the file:
    - Windows PowerShell:
      `[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))`
@@ -137,10 +139,13 @@ backend supports cookies from a signed-in YouTube session:
 
 Notes:
 
-- Use a throwaway Google account; cookies are credentials. Never commit them.
-- Cookies expire eventually — re-export when those videos start failing again.
-- `getVideoInfo` already retries with the `web_safari`/`tv` player clients
-  before giving up, so only genuinely challenged videos need cookies.
+- Use throwaway accounts; cookies are credentials. Never commit them.
+- Cookies expire eventually — re-export when those posts start failing again.
+- YouTube `getVideoInfo` retries with the `web_safari`/`tv` player clients
+  before giving up; X/Instagram have no equivalent player flag, so a public
+  post that returns "login required" needs cookies.
+- Instagram often rejects anonymous extraction from datacenter IPs even when
+  the post is public. Cookies help, but accounts can still be challenged.
 
 ## Troubleshooting a deployed backend
 
@@ -155,12 +160,11 @@ Notes:
   automatically switches to a single yt-dlp process and 2 fragments. Check
   `lowMemoryHost` in the diagnostics; force it with `GAC_LOW_MEMORY=1`.
 - `POST /api/info` returning the generic "Failed to retrieve video information.
-  Please try again." almost always means yt-dlp failed to start or was blocked
-  by YouTube; check the diagnostics first.
-- "YouTube is asking this server to verify it isn't a bot for this video" means
-  YouTube demands a signed-in session for that specific video from a datacenter
-  IP. Configure cookies (see the section above); other videos keep working
-  without them.
+  Please try again." usually means yt-dlp failed to start or the platform
+  blocked the request; check the diagnostics first.
+- "The source platform is asking this server to verify it isn't a bot" means
+  the platform demands a signed-in session from a datacenter IP. Configure
+  cookies (see the section above); other posts keep working without them.
 - Rebuild the image after pulling new commits: the Dockerfile verifies the
   binaries during the build. On Render use **Manual Deploy → Clear build cache &
   deploy** if an old cached layer still lacks yt-dlp.

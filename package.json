@@ -1,7 +1,7 @@
 {
   "name": "grabaclip",
   "version": "1.0.0",
-  "description": "Grab a Clip - Simple YouTube video downloader (Phase 1: Core Downloader)",
+  "description": "Grab a Clip - download video or audio from YouTube, X/Twitter and Instagram",
   "type": "module",
   "main": "server/index.js",
   "scripts": {

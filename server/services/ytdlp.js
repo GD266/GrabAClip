@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { isYouTubeUrl, normalizeYouTubeUrl } from "../utils/validation.js";
+import { isSupportedMediaUrl, detectPlatform, normalizeMediaUrl } from "../utils/validation.js";
 import { getRecentErrors } from "../utils/errorLog.js";
 
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
@@ -16,10 +16,11 @@ const DOWNLOAD_TIMEOUT_MS = 1200000; // 20min (1080p HLS can be large + slow lin
 const TEMP_ROOT = path.join(os.tmpdir(), "grabaclip");
 
 /**
- * Optional YouTube cookies. Datacenter IPs (Render, Railway, Fly, VPS) are
+ * Optional platform cookies. Datacenter IPs (Render, Railway, Fly, VPS) are
  * routinely challenged by YouTube with "Sign in to confirm you're not a bot"
- * on some videos; cookies from a signed-in session are the workaround yt-dlp
- * recommends. Configure exactly one:
+ * on some videos; X/Instagram can require a signed-in session or rate-limit
+ * anonymous requests. Cookies from a signed-in browser are the workaround
+ * yt-dlp recommends. Configure exactly one:
  *   YTDLP_COOKIES_FILE  path to a Netscape-format cookies.txt
  *   YTDLP_COOKIES_B64   base64 of that file (for hosts without file uploads)
  */
@@ -50,7 +51,7 @@ function resolveCookiesFile() {
 
 const COOKIES = resolveCookiesFile();
 
-/** Whether/how YouTube cookies are configured (diagnostics + startup log). */
+/** Whether/how platform cookies are configured (diagnostics + startup log). */
 export function getCookiesInfo() {
   return { configured: Boolean(COOKIES), source: COOKIES ? COOKIES.source : null };
 }
@@ -162,7 +163,18 @@ export function classifyYtDlpError(stderr, code) {
   const lower = (stderr || "").toLowerCase();
 
   if (lower.includes("video unavailable") || lower.includes("this video is unavailable")) {
-    return { status: 404, message: "Video unavailable. The video may have been removed or is not accessible." };
+    return { status: 404, message: "Video unavailable. It may have been removed or is not accessible." };
+  }
+  if (
+    lower.includes("tweet not found") ||
+    lower.includes("no video could be found") ||
+    lower.includes("no video in this post") ||
+    lower.includes("requested content is not available") ||
+    lower.includes("this post is unavailable") ||
+    lower.includes("post is unavailable") ||
+    lower.includes("media not found")
+  ) {
+    return { status: 404, message: "This post is unavailable or contains no downloadable video." };
   }
   if (lower.includes("private video")) {
     return { status: 403, message: "This video is private and cannot be downloaded." };
@@ -174,7 +186,7 @@ export function classifyYtDlpError(stderr, code) {
     return {
       status: 502,
       message:
-        "YouTube is asking this server to verify it isn't a bot for this video. Add YouTube cookies to the backend (YTDLP_COOKIES_B64, see DEPLOY.md) or try another video.",
+        "The source platform is asking this server to verify it isn't a bot. Add cookies to the backend (YTDLP_COOKIES_B64, see DEPLOY.md) or try another link.",
     };
   }
   // Age-restricted / authentication required — must be checked before generic 403
@@ -183,11 +195,12 @@ export function classifyYtDlpError(stderr, code) {
     lower.includes("age-restricted") ||
     lower.includes("age restricted") ||
     lower.includes("inappropriate for some users") ||
-    (lower.includes("sign in") && lower.includes("age")) ||
-    lower.includes("login required") ||
-    lower.includes("requires authentication")
+    (lower.includes("sign in") && lower.includes("age"))
   ) {
-    return { status: 403, message: "This video is age-restricted or requires sign-in." };
+    return { status: 403, message: "This video is age-restricted and requires sign-in." };
+  }
+  if (lower.includes("login required") || lower.includes("requires authentication")) {
+    return { status: 403, message: "This post is private or requires sign-in. Add cookies to the backend or try another public link." };
   }
   if (lower.includes("members-only") || lower.includes("join this channel") || lower.includes("members only")) {
     return { status: 403, message: "This video is members-only or requires purchase." };
@@ -198,20 +211,30 @@ export function classifyYtDlpError(stderr, code) {
   if (lower.includes("live event") || lower.includes("live chat") || lower.includes("premiere will begin")) {
     return { status: 400, message: "Live streams and premieres are not supported." };
   }
+  if (lower.includes("no video formats found")) {
+    return { status: 400, message: "No downloadable video was found in this link. Try a reel or video post." };
+  }
   if (
     lower.includes("requested format is not available") ||
     lower.includes("requested format not available") ||
     lower.includes("format not available") ||
-    lower.includes("format not found") ||
-    lower.includes("no video formats found")
+    lower.includes("format not found")
   ) {
     return { status: 400, message: "Requested quality is not available. Please choose another quality." };
   }
+  if (
+    lower.includes("rate-limit") ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes("http error 429")
+  ) {
+    return { status: 429, message: "The platform is rate-limiting this server. Wait a minute and try again." };
+  }
   if (lower.includes("unsupported url")) {
-    return { status: 400, message: "Unsupported URL. Please provide a valid YouTube video URL." };
+    return { status: 400, message: "Unsupported link. Paste a YouTube, X, or Instagram video URL." };
   }
   if (lower.includes("unable to extract") || lower.includes("extraction failed")) {
-    return { status: 502, message: "Failed to extract video information. YouTube may have changed its format or the video is restricted." };
+    return { status: 502, message: "Failed to extract video information. The platform may have changed its format or the post is restricted." };
   }
   // HTTP 403 on media data: YouTube periodically rejects the media URLs it
   // handed out (bot checks / stale signatures / IP throttling). The download
@@ -221,7 +244,7 @@ export function classifyYtDlpError(stderr, code) {
     return {
       status: 502,
       message:
-        "YouTube blocked this download (HTTP 403) even after retrying several sources. Wait a minute and try again — keeping yt-dlp up to date usually prevents this.",
+        "The source platform blocked this download (HTTP 403) even after retrying several sources. Wait a minute and try again, and keep yt-dlp up to date.",
     };
   }
   if (lower.includes("no audio stream")) {
@@ -231,8 +254,8 @@ export function classifyYtDlpError(stderr, code) {
         "Every source for this video came back without audio. Try another quality or wait a minute and retry.",
     };
   }
-  if (lower.includes("network") || lower.includes("timeout") || lower.includes("http error 429")) {
-    return { status: 502, message: "Network error while contacting YouTube. Please try again." };
+  if (lower.includes("network") || lower.includes("timeout")) {
+    return { status: 502, message: "Network error while contacting the source platform. Please try again." };
   }
   if (code === "TIMEOUT") {
     return { status: 504, message: "Request timed out while fetching video information. Please try again." };
@@ -348,6 +371,63 @@ function isHls(f) {
 
 function exactSize(f) {
   return f.filesize || f.filesize_approx || null;
+}
+
+/**
+ * X/Twitter's progressive MP4s do not always expose vcodec/acodec metadata,
+ * but yt-dlp still treats them as muxed files with audio. Their format ids
+ * look like `http-2176`.
+ */
+function isTwitterProgressive(f) {
+  const id = String(f.format_id || "");
+  return /^http-/i.test(id) && Boolean(f.height) && String(f.ext || "").toLowerCase() === "mp4";
+}
+
+function isMuxedFormat(f) {
+  const hasVideo = f.vcodec && f.vcodec !== "none";
+  const hasAudio = f.acodec && f.acodec !== "none";
+  return (hasVideo && hasAudio) || isTwitterProgressive(f);
+}
+
+/**
+ * Audio-only detection that also works for X's HLS audio entries, where
+ * yt-dlp omits acodec but reports video_ext=none / audio_ext=mp4.
+ */
+function isAudioOnlyFormat(f) {
+  if (!f || f.height) return false;
+  const vcodec = String(f.vcodec || "").toLowerCase();
+  const acodec = String(f.acodec || "").toLowerCase();
+  if (acodec && acodec !== "none") return true;
+  const videoExt = String(f.video_ext || "").toLowerCase();
+  const audioExt = String(f.audio_ext || "").toLowerCase();
+  if (videoExt === "none" && audioExt && audioExt !== "none") return true;
+  return vcodec === "none" && Boolean(f.abr || f.format_note || /audio/i.test(String(f.format_id || "")));
+}
+
+function pickBestAudio(rawFormats) {
+  if (!Array.isArray(rawFormats)) return null;
+  return [...rawFormats]
+    .filter(isAudioOnlyFormat)
+    .sort((a, b) => {
+      const extRank = (f) => (/^(m4a|mp4)$/i.test(String(f.ext || "")) ? 0 : 1);
+      const codecRank = (f) => (String(f.acodec || "").toLowerCase().startsWith("mp4a.40.2") ? 0 : 1);
+      return (
+        extRank(a) - extRank(b) ||
+        codecRank(a) - codecRank(b) ||
+        (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0)
+      );
+    })[0] || null;
+}
+
+/**
+ * The UI quality is the short side of the frame, so portrait reels use their
+ * width (720x1280 -> 720p) instead of an unbounded 1280.
+ */
+function qualityHeight(f) {
+  const width = Number(f.width) || 0;
+  const height = Number(f.height) || 0;
+  if (!height) return null;
+  return Math.round(width > 0 && width < height ? width : height);
 }
 
 /**
@@ -553,6 +633,122 @@ export function buildVideoFormats(rawFormats, duration = null, options = {}) {
   return plans;
 }
 
+/**
+ * Generic per-quality plans for X and Instagram.
+ *
+ * Unlike YouTube, these sites expose a small number of direct MP4/HLS
+ * renditions. The strategy is:
+ *  - prefer a muxed progressive MP4 (X often provides these),
+ *  - otherwise merge the best video-only rendition with the best audio-only
+ *    rendition,
+ *  - if the post is silent, expose a video-only plan rather than inventing an
+ *    audio track.
+ *
+ * Quality keys use the short side of the frame so portrait reels are labelled
+ * 720p (720x1280), not 1280p.
+ */
+export function buildGenericVideoFormats(rawFormats, duration = null) {
+  if (!Array.isArray(rawFormats)) return [];
+
+  const usable = rawFormats.filter(
+    (f) =>
+      f.format_id &&
+      f.ext &&
+      f.ext !== "mhtml" &&
+      !String(f.format_note || "").toLowerCase().includes("storyboard")
+  );
+
+  const videoFormats = usable.filter(
+    (f) => f.height && (isMuxedFormat(f) || (f.vcodec && f.vcodec !== "none"))
+  );
+  const bestAudio = pickBestAudio(usable);
+
+  const byQuality = new Map();
+  for (const f of videoFormats) {
+    const quality = qualityHeight(f);
+    if (!quality || quality < 144 || quality > 1080) continue;
+    if (!byQuality.has(quality)) byQuality.set(quality, []);
+    byQuality.get(quality).push(f);
+  }
+
+  const plans = [];
+  const qualities = [...byQuality.keys()].sort((a, b) => b - a);
+
+  for (const quality of qualities) {
+    const candidates = byQuality.get(quality);
+
+    // A progressive file already contains both streams.
+    const progressive = candidates
+      .filter(isMuxedFormat)
+      .sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+
+    if (progressive) {
+      const formatId = progressive.format_id;
+      plans.push({
+        height: quality,
+        label: `${quality}p`,
+        displayLabel: `${quality}p`,
+        ext: "mp4",
+        hasAudio: true,
+        kind: "progressive",
+        source: "progressive",
+        codecLabel: codecLabel(progressive.vcodec),
+        formatId,
+        formatIds: [formatId],
+        vcodec: progressive.vcodec || null,
+        acodec: progressive.acodec || "aac",
+        fps: progressive.fps || null,
+        estimatedSize: estimateSize(progressive, duration),
+        selectors: [
+          formatId,
+          "best",
+          "bestvideo*+bestaudio/best",
+        ],
+      });
+      continue;
+    }
+
+    const videoOnly = candidates
+      .filter((f) => f.vcodec && f.vcodec !== "none")
+      .sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+    if (!videoOnly) continue;
+
+    const vSize = estimateSize(videoOnly, duration);
+    const aSize = bestAudio ? estimateSize(bestAudio, duration) : null;
+    const formatIds = bestAudio
+      ? [videoOnly.format_id, bestAudio.format_id]
+      : [videoOnly.format_id];
+
+    plans.push({
+      height: quality,
+      label: `${quality}p`,
+      displayLabel: `${quality}p`,
+      ext: "mp4",
+      hasAudio: Boolean(bestAudio),
+      kind: bestAudio ? "merge" : "video",
+      source: isHls(videoOnly) ? "hls" : "dash",
+      codecLabel: codecLabel(videoOnly.vcodec),
+      formatId: formatIds.join("+"),
+      formatIds,
+      vcodec: videoOnly.vcodec,
+      acodec: bestAudio?.acodec || null,
+      fps: videoOnly.fps || null,
+      videoSize: vSize,
+      audioSize: aSize,
+      estimatedSize: vSize && aSize ? vSize + aSize : vSize || aSize || null,
+      selectors: bestAudio
+        ? [
+            `${videoOnly.format_id}+${bestAudio.format_id}`,
+            `${videoOnly.format_id}+bestaudio/best`,
+            "bestvideo*+bestaudio/best",
+          ]
+        : [videoOnly.format_id, "best"],
+    });
+  }
+
+  return plans;
+}
+
 /** Always-available audio options (see AUDIO_OPTIONS). */
 export function buildAudioFormats() {
   return AUDIO_OPTIONS.map((o) => ({ ...o }));
@@ -582,16 +778,48 @@ export function pickAudioSource(rawFormats) {
     };
   }
 
-  const bestAudio = [...rawFormats]
-    .filter((f) => (!f.vcodec || f.vcodec === "none") && f.acodec && f.acodec !== "none")
-    .sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
+  // X exposes audio-only HLS renditions (no height, and sometimes no acodec
+  // field at all).
+  const hlsAudioOnly = rawFormats.filter((f) => isHls(f) && isAudioOnlyFormat(f));
+  if (hlsAudioOnly.length > 0) {
+    const lc = hlsAudioOnly.filter((f) => String(f.acodec || "").toLowerCase().startsWith("mp4a.40.2"));
+    const pool = lc.length > 0 ? lc : hlsAudioOnly;
+    const chosen = [...pool].sort((a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0))[0];
+    const kbps = Math.round(chosen.abr || chosen.tbr || 0);
+    return {
+      formatId: chosen.format_id,
+      height: null,
+      ext: chosen.ext || "m4a",
+      acodec: chosen.acodec || "aac",
+      label: `HLS audio${kbps ? ` (${kbps}k)` : ""}`,
+    };
+  }
+
+  const bestAudio = pickBestAudio(rawFormats);
   if (bestAudio) {
+    const kbps = Math.round(bestAudio.abr || bestAudio.tbr || 0);
     return {
       formatId: bestAudio.format_id,
       height: null,
       ext: bestAudio.ext,
-      acodec: bestAudio.acodec,
-      label: `DASH audio (${Math.round(bestAudio.abr || bestAudio.tbr || 0)}k)`,
+      acodec: bestAudio.acodec || "aac",
+      label: `DASH audio${kbps ? ` (${kbps}k)` : ""}`,
+    };
+  }
+
+  // Last resort: some posts only expose a muxed progressive file. `-x` can
+  // still extract its audio, so offer it instead of disabling the audio tab.
+  const muxed = rawFormats
+    .filter((f) => f.height && isMuxedFormat(f))
+    .sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+  if (muxed) {
+    const quality = qualityHeight(muxed);
+    return {
+      formatId: muxed.format_id,
+      height: quality,
+      ext: muxed.ext || "mp4",
+      acodec: muxed.acodec || "aac",
+      label: `Muxed audio${quality ? ` (${quality}p)` : ""}`,
     };
   }
 
@@ -610,13 +838,15 @@ export async function getVideoInfo(rawUrl, options = {}) {
     err.status = 499;
     throw err;
   }
-  if (!isYouTubeUrl(rawUrl)) {
-    const err = new Error("Invalid YouTube URL");
+  const platform = detectPlatform(rawUrl);
+  if (!platform || !isSupportedMediaUrl(rawUrl)) {
+    const err = new Error("Unsupported link. Paste a YouTube, X, or Instagram video URL.");
     err.status = 400;
     throw err;
   }
 
-  const url = normalizeYouTubeUrl(rawUrl);
+  const url = normalizeMediaUrl(rawUrl);
+  const isYouTube = platform === "youtube";
 
   const baseArgs = [
     ...YTDLP_QUIET_FLAGS,
@@ -627,13 +857,12 @@ export async function getVideoInfo(rawUrl, options = {}) {
     "1",
   ];
 
-  // Try the default extraction first. If YouTube answers with a datacenter-IP
-  // bot check (or another player-specific error), retry with the alternate
-  // player clients the download retry chain uses. Genuinely unavailable
-  // videos fail fatally and are not retried.
+  // YouTube's datacenter-IP bot checks need alternate player clients. X and
+  // Instagram have no equivalent player flag, so one fresh extraction is used.
   let result = null;
   let lastError = null;
-  for (const playerClient of [null, "web_safari", "web_embedded", "tv"]) {
+  const playerClients = isYouTube ? [null, "web_safari", "web_embedded", "tv"] : [null];
+  for (const playerClient of playerClients) {
     const args = [...baseArgs];
     if (playerClient) args.push("--extractor-args", `youtube:player_client=${playerClient}`);
     args.push(url);
@@ -666,10 +895,29 @@ export async function getVideoInfo(rawUrl, options = {}) {
     throw err;
   }
 
+  // A single X post can attach several videos, and an Instagram carousel can
+  // contain several media items. Pick the first video entry and remember its
+  // playlist position so the download job grabs the same item.
+  let playlistItem = null;
   if (data._type === "playlist") {
-    const err = new Error("Playlists are not supported. Please provide a single video URL.");
-    err.status = 400;
-    throw err;
+    if (isYouTube) {
+      const err = new Error("Playlists are not supported. Please provide a single video URL.");
+      err.status = 400;
+      throw err;
+    }
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    const index = entries.findIndex(
+      (entry) =>
+        Array.isArray(entry.formats) &&
+        entry.formats.some((f) => f.height && (isMuxedFormat(f) || (f.vcodec && f.vcodec !== "none")))
+    );
+    if (index < 0) {
+      const err = new Error("No downloadable video was found in this post.");
+      err.status = 400;
+      throw err;
+    }
+    data = { ...data, ...entries[index] };
+    playlistItem = index + 1;
   }
 
   const videoId = data.id;
@@ -696,15 +944,29 @@ export async function getVideoInfo(rawUrl, options = {}) {
     uploadDate = String(data.release_date);
   }
 
-  // Two plan sets from one extraction: `formats` is size-optimised (AV1/VP9
-  // sources are roughly half the size of H.264) while `formatsCompatible`
-  // stays on H.264 for maximum player compatibility.
-  const formats = buildVideoFormats(data.formats, duration, { preferSize: true });
-  const formatsCompatible = buildVideoFormats(data.formats, duration);
-  const audioFormats = buildAudioFormats();
+  // YouTube keeps its size-optimised + compatibility plan sets. X/Instagram
+  // are planned from their direct renditions.
+  const formats = isYouTube
+    ? buildVideoFormats(data.formats, duration, { preferSize: true })
+    : buildGenericVideoFormats(data.formats, duration);
+  const formatsCompatible = isYouTube
+    ? buildVideoFormats(data.formats, duration)
+    : formats;
   const audioSource = pickAudioSource(data.formats);
+  const audioFormats = audioSource ? buildAudioFormats() : [];
+
+  if (!formats.length) {
+    const err = new Error(
+      platform === "instagram"
+        ? "No downloadable video was found in this Instagram post. Try a reel or video post."
+        : "No downloadable video was found in this link."
+    );
+    err.status = 400;
+    throw err;
+  }
 
   return {
+    platform,
     videoId,
     title,
     channel,
@@ -724,6 +986,8 @@ export async function getVideoInfo(rawUrl, options = {}) {
     audioSource,
     // Internal: used by the audio route to pick the extraction source.
     _audioSourceId: audioSource?.formatId || null,
+    // Internal: Instagram carousels / multi-media posts.
+    _playlistItem: playlistItem,
     _rawData: {
       tags: data.tags || null,
       categories: data.categories || null,
@@ -798,9 +1062,10 @@ function extractorArgFlags(extractorArgs) {
  * to alternate YouTube player clients, which expose different (often
  * unblocked) media URLs.
  */
-export function buildVideoAttempts({ plan = null, height = null, formatId = null } = {}) {
+export function buildVideoAttempts({ plan = null, height = null, formatId = null, platform = null } = {}) {
   const attempts = [];
   const seen = new Set();
+  const isYouTube = platform ? platform === "youtube" : true;
   const add = (selector, options = {}) => {
     if (!selector) return;
     const key = `${selector}|${(options.extractorArgs || []).join(",")}`;
@@ -814,17 +1079,26 @@ export function buildVideoAttempts({ plan = null, height = null, formatId = null
   if (plan?.selectors?.length) {
     for (const selector of plan.selectors) add(selector, { note: "Starting download…" });
   } else if (formatId) {
-    // Legacy callers pass a raw yt-dlp format id. Always pair it with audio:
-    // a bare video-only format id would produce a silent file.
-    add(`${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio`, { note: "Starting download…" });
-    add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]`, { note: "Trying an alternative source…" });
-    add(`bestvideo[height<=${h}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=${h}][vcodec^=avc1]+bestaudio`, {
-      note: "Trying a safe video+audio source…",
-    });
-  } else {
+    // Legacy callers pass a raw yt-dlp format id. Always pair it with audio so
+    // a video-only id cannot produce a silent file.
+    if (isYouTube) {
+      add(`${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio`, { note: "Starting download…" });
+      add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]`, { note: "Trying an alternative source…" });
+      add(`bestvideo[height<=${h}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=${h}][vcodec^=avc1]+bestaudio`, {
+        note: "Trying a safe video+audio source…",
+      });
+    } else {
+      add(`${formatId}+bestaudio/best`, { note: "Starting download…" });
+      add(formatId, { note: "Trying the selected source directly…" });
+      add("bestvideo*+bestaudio/best", { note: "Trying a safe video+audio source…" });
+    }
+  } else if (isYouTube) {
     add(`bestvideo[height<=${h}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}][protocol*=m3u8]/best[height<=${h}]`, {
       note: "Starting download…",
     });
+  } else {
+    add("bestvideo*+bestaudio/best", { note: "Starting download…" });
+    add("best", { note: "Trying an alternative source…" });
   }
 
   // Retry the preferred source once with a fresh extraction before falling
@@ -845,33 +1119,48 @@ export function buildVideoAttempts({ plan = null, height = null, formatId = null
     attempts.splice(1, 0, { ...attempts[0], note: "Source was blocked — retrying with fresh links…", delayMs: 1200 });
   }
 
-  // Last resorts: alternate player clients. web_safari exposes the full muxed
-  // HLS ladder, web_embedded exposes the DASH ladder (video-only + audio, so
-  // its selector always pairs audio), tv/mweb expose small progressive formats.
-  add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]/best`, {
-    extractorArgs: ["youtube:player_client=web_safari"],
-    note: "Trying an alternate YouTube player…",
-    delayMs: 800,
-  });
-  add(`bestvideo[height<=${h}]+bestaudio[ext=m4a]/best[height<=${h}][protocol*=m3u8]/best[height<=${h}]`, {
-    extractorArgs: ["youtube:player_client=web_embedded"],
-    note: "Trying an alternate YouTube player…",
-    delayMs: 800,
-  });
-  add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]/best`, {
-    extractorArgs: ["youtube:player_client=tv"],
-    note: "Trying an alternate YouTube player…",
-    delayMs: 800,
-  });
+  if (isYouTube) {
+    // Last resorts: alternate player clients. web_safari exposes the full
+    // muxed HLS ladder, web_embedded exposes the DASH ladder (video-only +
+    // audio, so its selector always pairs audio), tv/mweb expose small
+    // progressive formats.
+    add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]/best`, {
+      extractorArgs: ["youtube:player_client=web_safari"],
+      note: "Trying an alternate YouTube player…",
+      delayMs: 800,
+    });
+    add(`bestvideo[height<=${h}]+bestaudio[ext=m4a]/best[height<=${h}][protocol*=m3u8]/best[height<=${h}]`, {
+      extractorArgs: ["youtube:player_client=web_embedded"],
+      note: "Trying an alternate YouTube player…",
+      delayMs: 800,
+    });
+    add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]/best`, {
+      extractorArgs: ["youtube:player_client=tv"],
+      note: "Trying an alternate YouTube player…",
+      delayMs: 800,
+    });
+  }
 
   return attempts.slice(0, 9);
 }
 
 /**
  * Build the ordered run plan (attempts) for an audio download.
- * Small muxed HLS variants are the last resort: `-x` extracts their audio.
+ * Small muxed renditions are the last resort: `-x` extracts their audio.
  */
-export function buildAudioAttempts({ sourceFormatId = null } = {}) {
+export function buildAudioAttempts({ sourceFormatId = null, platform = null } = {}) {
+  const isYouTube = platform ? platform === "youtube" : true;
+
+  if (!isYouTube) {
+    const ladder = sourceFormatId ? `${sourceFormatId}/bestaudio/best` : "bestaudio/best";
+    return [
+      { selector: ladder, note: "Starting audio download…" },
+      { selector: ladder, note: "Source was blocked — retrying with fresh links…", delayMs: 1200 },
+      { selector: "bestaudio[ext=m4a]/bestaudio/best", note: "Trying an alternative audio source…", delayMs: 600 },
+      { selector: "best", note: "Trying the best available file…", delayMs: 600 },
+    ];
+  }
+
   const ladder = sourceFormatId ? `${sourceFormatId}/${AUDIO_SOURCE_LADDER}` : AUDIO_SOURCE_LADDER;
   return [
     { selector: ladder, note: "Starting audio download…" },
@@ -916,7 +1205,17 @@ export function isFatalDownloadError(stderr) {
     s.includes("made this video unavailable") ||
     s.includes("this live event") ||
     s.includes("premiere will begin") ||
-    s.includes("unsupported url")
+    s.includes("unsupported url") ||
+    s.includes("tweet not found") ||
+    s.includes("no video could be found") ||
+    s.includes("no video in this post") ||
+    s.includes("requested content is not available") ||
+    s.includes("this post is unavailable") ||
+    s.includes("post is unavailable") ||
+    s.includes("rate-limit") ||
+    s.includes("rate limit") ||
+    s.includes("too many requests") ||
+    s.includes("http error 429")
   );
 }
 
@@ -925,10 +1224,10 @@ export function isFatalDownloadError(stderr) {
  * yt-dlp writes the finished file into a temp dir; the caller streams it.
  */
 export function startVideoDownload(rawUrl, options = {}) {
-  const { selector, extractorArgs = null } = options;
+  const { selector, extractorArgs = null, playlistItem = null } = options;
 
-  if (!isYouTubeUrl(rawUrl)) {
-    const err = new Error("Invalid YouTube URL");
+  if (!isSupportedMediaUrl(rawUrl)) {
+    const err = new Error("Unsupported link. Paste a YouTube, X, or Instagram video URL.");
     err.status = 400;
     throw err;
   }
@@ -937,12 +1236,13 @@ export function startVideoDownload(rawUrl, options = {}) {
     err.status = 500;
     throw err;
   }
-  const url = normalizeYouTubeUrl(rawUrl);
+  const url = normalizeMediaUrl(rawUrl);
   const tmpDir = makeJobDir();
 
   const args = [
     ...YTDLP_JOB_FLAGS,
     ...extractorArgFlags(extractorArgs),
+    ...(playlistItem ? ["--playlist-items", String(playlistItem)] : []),
     "-f",
     selector,
     "--merge-output-format",
@@ -963,10 +1263,10 @@ export function startVideoDownload(rawUrl, options = {}) {
  * (-x --audio-format), which produces correct containers/extradata.
  */
 export function startAudioDownload(rawUrl, options = {}) {
-  const { format = "m4a", quality = null, selector, extractorArgs = null } = options;
+  const { format = "m4a", quality = null, selector, extractorArgs = null, playlistItem = null } = options;
 
-  if (!isYouTubeUrl(rawUrl)) {
-    const err = new Error("Invalid YouTube URL");
+  if (!isSupportedMediaUrl(rawUrl)) {
+    const err = new Error("Unsupported link. Paste a YouTube, X, or Instagram video URL.");
     err.status = 400;
     throw err;
   }
@@ -975,7 +1275,7 @@ export function startAudioDownload(rawUrl, options = {}) {
     err.status = 500;
     throw err;
   }
-  const url = normalizeYouTubeUrl(rawUrl);
+  const url = normalizeMediaUrl(rawUrl);
 
   const requested = String(format).toLowerCase().trim();
   if (!AUDIO_FORMAT_IDS.has(requested)) {
@@ -1003,6 +1303,7 @@ export function startAudioDownload(rawUrl, options = {}) {
   const args = [
     ...YTDLP_JOB_FLAGS,
     ...extractorArgFlags(extractorArgs),
+    ...(playlistItem ? ["--playlist-items", String(playlistItem)] : []),
     "-f",
     selector,
     "-x",
@@ -1046,10 +1347,10 @@ function findPartFile(tmpDir, prefix) {
  * single event surface `runMediaJob` expects.
  */
 export function startMergeDownload(rawUrl, options = {}) {
-  const { videoSelector, audioSelector, extractorArgs = null, videoSize = null, audioSize = null } = options;
+  const { videoSelector, audioSelector, extractorArgs = null, playlistItem = null, videoSize = null, audioSize = null } = options;
 
-  if (!isYouTubeUrl(rawUrl)) {
-    const err = new Error("Invalid YouTube URL");
+  if (!isSupportedMediaUrl(rawUrl)) {
+    const err = new Error("Unsupported link. Paste a YouTube, X, or Instagram video URL.");
     err.status = 400;
     throw err;
   }
@@ -1059,10 +1360,16 @@ export function startMergeDownload(rawUrl, options = {}) {
     throw err;
   }
 
-  const url = normalizeYouTubeUrl(rawUrl);
+  const url = normalizeMediaUrl(rawUrl);
   const tmpDir = makeJobDir();
   const ffmpegBin = process.env.FFMPEG_BIN || "ffmpeg";
-  const baseFlags = [...YTDLP_JOB_FLAGS, ...extractorArgFlags(extractorArgs), "--socket-timeout", "20"];
+  const baseFlags = [
+    ...YTDLP_JOB_FLAGS,
+    ...extractorArgFlags(extractorArgs),
+    ...(playlistItem ? ["--playlist-items", String(playlistItem)] : []),
+    "--socket-timeout",
+    "20",
+  ];
 
   const videoProc = spawnJob([...baseFlags, "-f", videoSelector, "-o", path.join(tmpDir, "video.%(ext)s"), url]);
   const audioProc = spawnJob([...baseFlags, "-f", audioSelector, "-o", path.join(tmpDir, "audio.%(ext)s"), url]);

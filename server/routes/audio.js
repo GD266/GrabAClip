@@ -1,6 +1,6 @@
 import { Router } from "express";
 import fs from "node:fs";
-import { sanitizeFilename, sanitizeAsciiFilename, isYouTubeUrl, normalizeYouTubeUrl } from "../utils/validation.js";
+import { sanitizeFilename, sanitizeAsciiFilename, detectPlatform, normalizeMediaUrl } from "../utils/validation.js";
 import {
   startAudioDownload,
   getVideoInfo,
@@ -24,13 +24,13 @@ router.get("/", async (req, res) => {
   const formatParam = req.query.format || req.query.formatId || "m4a";
 
   if (!url || typeof url !== "string" || !url.trim()) {
-    return res.status(400).json({ error: "YouTube URL is required." });
+    return res.status(400).json({ error: "A video link is required." });
   }
-  if (!isYouTubeUrl(url)) {
-    return res.status(400).json({ error: "Invalid YouTube URL." });
+  const normalizedUrl = normalizeMediaUrl(url);
+  if (!normalizedUrl) {
+    return res.status(400).json({ error: "Unsupported link. Paste a YouTube, X, or Instagram video URL." });
   }
-
-  const normalizedUrl = normalizeYouTubeUrl(url);
+  const platform = detectPlatform(normalizedUrl);
   let format = String(formatParam).toLowerCase().trim();
   // Aliases from older clients.
   if (format === "best" || format === "high" || format === "aac") format = "m4a";
@@ -48,9 +48,9 @@ router.get("/", async (req, res) => {
     quality = q;
   }
 
-  // Prevent duplicate active audio downloads for the same video
+  // Prevent duplicate active audio downloads for the same link
   if (isActive("audio", normalizedUrl)) {
-    return res.status(429).json({ error: "An audio download for this video is already in progress. Please wait or refresh the page." });
+    return res.status(429).json({ error: "An audio download for this link is already in progress. Please wait or refresh the page." });
   }
 
   startDownload("audio", normalizedUrl);
@@ -97,9 +97,9 @@ router.get("/", async (req, res) => {
 
   const sourceFormatId = info._audioSourceId || null;
 
-  // Ordered fallback chain: preferred HLS source -> fresh retry -> audio-only
-  // fallbacks -> alternate YouTube player clients.
-  const attempts = buildAudioAttempts({ sourceFormatId });
+  // Ordered fallback chain: preferred source -> fresh retry -> audio-only
+  // fallbacks. YouTube additionally gets alternate player clients.
+  const attempts = buildAudioAttempts({ sourceFormatId, platform });
 
   setPhase("audio", normalizedUrl, "processing");
   setProgressDetail("audio", normalizedUrl, 0, attempts[0]?.note || "Starting download…");
@@ -136,8 +136,13 @@ router.get("/", async (req, res) => {
 
   const result = await runMediaJob({
     attempts,
-    startJob: (attempt) => startAudioDownload(normalizedUrl, { ...attempt, format, quality }),
-    onProgress: (pct) => setProgressDetail("audio", normalizedUrl, pct, `Downloading from YouTube… ${Math.round(pct)}%`),
+    startJob: (attempt) => startAudioDownload(normalizedUrl, {
+      ...attempt,
+      format,
+      quality,
+      playlistItem: info._playlistItem || null,
+    }),
+    onProgress: (pct) => setProgressDetail("audio", normalizedUrl, pct, `Downloading audio… ${Math.round(pct)}%`),
     onDetail: (text) => setProgressDetail("audio", normalizedUrl, null, text),
     signal: jobController.signal,
   });

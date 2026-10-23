@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="dark" />
-  <title>Grab a Clip — YouTube downloader</title>
+  <title>Grab a Clip — YouTube, X &amp; Instagram downloader</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" sizes="any" />
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -18,10 +18,10 @@
           </span>
           <span class="brand-name">Grab a Clip</span>
           <span class="brand-dot" aria-hidden="true"></span>
-          <span class="brand-tagline">YouTube downloader</span>
+          <span class="brand-tagline">Universal media downloader</span>
         </div>
         <div class="header-actions">
-          <span class="header-meta">Video · Audio · Transcript</span>
+          <span class="header-meta">YouTube · X · Instagram · Video · Audio</span>
         </div>
       </div>
     </header>
@@ -30,12 +30,12 @@
       <!-- Hero -->
       <section class="hero">
         <div class="hero-copy">
-          <h1 class="hero-title">Paste a YouTube link and grab it.</h1>
-          <p class="hero-sub">Download video with audio or extract audio in your choice of quality — local, instant, no account.</p>
+          <h1 class="hero-title">Paste a link. Grab the clip.</h1>
+          <p class="hero-sub">Download video with audio or extract audio from YouTube, X, and Instagram — local, instant, no account.</p>
         </div>
 
         <div class="hero-field">
-          <label for="urlInput" class="sr-only">YouTube URL</label>
+          <label for="urlInput" class="sr-only">Video URL</label>
           <div class="input-shell" id="inputShell">
             <div class="input-icon" aria-hidden="true">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
@@ -43,7 +43,7 @@
             <input
               id="urlInput"
               type="url"
-              placeholder="https://www.youtube.com/watch?v=…  or  https://youtu.be/…"
+              placeholder="Paste a YouTube, X, or Instagram link…"
               autocomplete="off"
               spellcheck="false"
               inputmode="url"
@@ -145,7 +145,7 @@
             <div id="qualityGrid" class="option-grid" role="radiogroup" aria-label="Video quality"></div>
             <p id="videoSourceNote" class="option-note"></p>
 
-            <label class="size-toggle" for="smallFileToggle">
+            <label class="size-toggle" id="sizeToggleRow" for="smallFileToggle">
               <input type="checkbox" id="smallFileToggle" checked />
               <span class="size-toggle-body">
                 <span class="size-toggle-title">Smaller file</span>

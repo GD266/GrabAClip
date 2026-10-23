@@ -1,5 +1,11 @@
 // Grab a Clip — frontend logic
-import { isYouTubeUrl, extractVideoId, normalizeYouTubeUrl } from "/shared/validator.js";
+import {
+  isYouTubeUrl,
+  detectPlatform,
+  isSupportedMediaUrl,
+  normalizeMediaUrl,
+  extractMediaId,
+} from "/shared/validator.js";
 
 // The API may live on another origin (Vercel frontend + container backend).
 // `public/config.js` sets window.GAC_API_BASE; empty means same origin.
@@ -69,6 +75,7 @@ const cancelVideoBtn = $("cancelVideoBtn");
 const videoProgressEl = $("videoProgress");
 const downloadStatusEl = $("downloadStatus");
 const smallFileToggle = $("smallFileToggle");
+const sizeToggleRowEl = $("sizeToggleRow");
 
 // Audio panel
 const audioOptionsEl = $("audioOptions");
@@ -93,11 +100,18 @@ const aiErrorEl = $("aiError");
 // State
 let currentUrl = "";
 let currentInfo = null;
+let currentPlatform = null;
 let selectedHeight = null;
 let selectedAudio = null;
 const downloads = {
   video: { active: false, controller: null, poll: null },
   audio: { active: false, controller: null, poll: null },
+};
+
+const PLATFORM_NAMES = {
+  youtube: "YouTube",
+  x: "X",
+  instagram: "Instagram",
 };
 
 const PHASE_LABELS = {
@@ -186,6 +200,12 @@ function activateTab(name) {
   }
 }
 
+function setIntelligenceAvailability(platform) {
+  const available = platform === "youtube";
+  tabs.intel.classList.toggle("hidden", !available);
+  if (!available && tabs.intel.classList.contains("is-active")) activateTab("video");
+}
+
 // ---------------------------------------------------------------------------
 // Info
 // ---------------------------------------------------------------------------
@@ -194,20 +214,21 @@ async function getVideo() {
   const url = urlInput.value.trim();
 
   if (!url) {
-    setStatus(statusEl, "Please paste a YouTube URL.", "error");
+    setStatus(statusEl, "Please paste a YouTube, X, or Instagram link.", "error");
     return;
   }
-  if (!isYouTubeUrl(url)) {
-    setStatus(statusEl, "Invalid YouTube URL. Use https://www.youtube.com/watch?v=… or https://youtu.be/…", "error");
+  if (!isSupportedMediaUrl(url)) {
+    setStatus(statusEl, "Unsupported link. Use a YouTube video, X post, or Instagram reel/post URL.", "error");
     return;
   }
 
   // The server always works with the canonical URL (status entries, de-dupe).
   // Normalise here too, otherwise progress polling can never match the job
-  // (youtu.be links, mobile links, &t=/&list= parameters, ...).
-  const normalizedUrl = normalizeYouTubeUrl(url) || url;
+  // (youtu.be links, mobile links, &t=/&list= parameters, X /video/N, ...).
+  const normalizedUrl = normalizeMediaUrl(url) || url;
+  const requestedPlatform = detectPlatform(normalizedUrl);
 
-  setStatus(statusEl, "Fetching video information…", "loading");
+  setStatus(statusEl, "Fetching media information…", "loading");
   getVideoBtn.disabled = true;
   const label = getVideoBtn.querySelector(".btn-label");
   const spinner = getVideoBtn.querySelector(".btn-spinner");
@@ -223,17 +244,21 @@ async function getVideo() {
       body: JSON.stringify({ url: normalizedUrl }),
     });
     const data = await readApiJson(res);
-    if (!res.ok) throw new Error(data.error || `Failed to retrieve video information. ${apiHint()}`);
+    if (!res.ok) throw new Error(data.error || `Failed to retrieve media information. ${apiHint()}`);
 
     currentUrl = normalizedUrl;
     currentInfo = data;
+    currentPlatform = data.platform || requestedPlatform || null;
 
     vTitleEl.textContent = data.title || "Untitled";
     vChannelEl.textContent = data.channel || "Unknown";
     vDurationEl.textContent =
       data.durationFormatted ||
       (data.duration ? `${Math.floor(data.duration / 60)}:${String(data.duration % 60).padStart(2, "0")}` : "Unknown");
-    vIdKickerEl.textContent = data.videoId ? `ID ${data.videoId}` : "";
+    const platformName = PLATFORM_NAMES[currentPlatform] || "";
+    vIdKickerEl.textContent = data.videoId
+      ? `${platformName ? `${platformName} · ` : ""}ID ${data.videoId}`
+      : platformName;
     vUploadDateEl.textContent = data.uploadDateFormatted || data.uploadDate || "Unknown";
     vViewsEl.textContent = data.viewCount != null ? Number(data.viewCount).toLocaleString() : "Unknown";
     vLikesEl.textContent = data.likeCount != null ? Number(data.likeCount).toLocaleString() : "Unknown";
@@ -257,6 +282,10 @@ async function getVideo() {
       thumbFallbackEl.classList.remove("hidden");
     }
 
+    // The H.264 compatibility choice only exists for YouTube's plan sets.
+    if (sizeToggleRowEl) sizeToggleRowEl.classList.toggle("hidden", currentPlatform !== "youtube");
+    setIntelligenceAvailability(currentPlatform);
+
     renderVideoOptions(videoFormatsForUi());
     renderAudioOptions(data.audioFormats || [], data.audioSource || null);
 
@@ -276,7 +305,7 @@ async function getVideo() {
 
     resultArea.classList.remove("hidden");
     activateTab("video");
-    setStatus(statusEl, "Video ready. Pick a quality and download.", "success");
+    setStatus(statusEl, "Media ready. Pick a quality and download.", "success");
   } catch (err) {
     setStatus(statusEl, errorMessage(err, "An error occurred."), "error");
     resultArea.classList.add("hidden");
@@ -296,6 +325,7 @@ async function getVideo() {
 
 function sourceLabel(plan) {
   if (!plan) return "";
+  if (plan.hasAudio === false || plan.kind === "video") return "Video only";
   if (plan.kind === "muxed") return "HLS stream";
   if (plan.kind === "merge") return "Video + audio merge";
   return "Single file";
@@ -328,7 +358,7 @@ function renderVideoOptions(formats) {
     selectedHeight = null;
     const empty = document.createElement("p");
     empty.className = "option-note";
-    empty.textContent = "No downloadable video qualities were found for this video.";
+    empty.textContent = "No downloadable video qualities were found for this link.";
     qualityGridEl.appendChild(empty);
     videoSourceNoteEl.textContent = "";
     downloadBtn.disabled = true;
@@ -374,7 +404,8 @@ function selectVideoOption(height) {
   if (plan) {
     const size = plan.estimatedSize ? ` · approx. ${formatBytes(plan.estimatedSize)}` : "";
     const codec = plan.codecLabel ? ` · ${plan.codecLabel}` : "";
-    videoSourceNoteEl.textContent = `${plan.label}${codec} · ${sourceLabel(plan)} · includes audio${size}`;
+    const audio = plan.hasAudio === false ? "no audio track" : "includes audio";
+    videoSourceNoteEl.textContent = `${plan.label}${codec} · ${sourceLabel(plan)} · ${audio}${size}`;
   } else {
     videoSourceNoteEl.textContent = "";
   }
@@ -385,6 +416,10 @@ function renderAudioOptions(options, audioSource) {
   if (!options.length) {
     selectedAudio = null;
     downloadAudioBtn.disabled = true;
+    const empty = document.createElement("p");
+    empty.className = "option-note";
+    empty.textContent = "No audio track was found for this link.";
+    audioOptionsEl.appendChild(empty);
     audioSourceNoteEl.textContent = "";
     return;
   }
@@ -522,7 +557,7 @@ function formatEta(seconds) {
 function startPhasePolling(type, url, statusTarget, progressEl, estimatedBytes = null) {
   stopPhasePolling(type);
   const state = downloads[type];
-  const wantedId = extractVideoId(url);
+  const wantedId = extractMediaId(url);
   let lastPct = null;
   let lastAt = Date.now();
 
@@ -531,10 +566,10 @@ function startPhasePolling(type, url, statusTarget, progressEl, estimatedBytes =
       const res = await fetch(apiUrl("/api/downloads/status"));
       if (!res.ok) return;
       const data = await res.json();
-      // Match on the canonical URL, falling back to the video id so the job is
-      // found even if the page ever holds a different URL shape.
+      // Match on the canonical URL, falling back to the platform media id so
+      // the job is found even if the page holds a different URL shape.
       const entry = (data.downloads || []).find(
-        (d) => d.type === type && (d.url === url || (wantedId && extractVideoId(d.url) === wantedId))
+        (d) => d.type === type && (d.url === url || (wantedId && extractMediaId(d.url) === wantedId))
       );
       if (!entry) return;
       if (receivedBytes[type]) return; // byte progress has taken over
@@ -733,7 +768,7 @@ async function getIntelligence() {
     return;
   }
   if (!isYouTubeUrl(url)) {
-    setStatus(intelligenceStatusEl, "Invalid YouTube URL.", "error");
+    setStatus(intelligenceStatusEl, "Intelligence is available for YouTube links only.", "error");
     return;
   }
 

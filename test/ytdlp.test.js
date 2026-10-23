@@ -8,6 +8,7 @@ import { PassThrough } from "node:stream";
 
 import {
   buildVideoFormats,
+  buildGenericVideoFormats,
   buildAudioFormats,
   pickAudioSource,
   classifyYtDlpError,
@@ -108,6 +109,84 @@ const progressive18 = {
   height: 360,
   tbr: 600,
   fps: 30,
+};
+
+// X/Twitter: progressive MP4s omit vcodec/acodec but are muxed, and the HLS
+// audio entries use audio_ext instead of acodec.
+const xAudio128 = {
+  format_id: "hls-audio-128000-Audio",
+  ext: "mp4",
+  protocol: "m3u8_native",
+  vcodec: "none",
+  video_ext: "none",
+  audio_ext: "mp4",
+  abr: 128,
+  tbr: 128,
+};
+
+const xHls720Video = {
+  format_id: "hls-716",
+  ext: "mp4",
+  protocol: "m3u8_native",
+  vcodec: "avc1.64001F",
+  acodec: "none",
+  width: 728,
+  height: 720,
+  tbr: 716,
+};
+
+const xProgressive720 = {
+  format_id: "http-2176",
+  ext: "mp4",
+  protocol: "https",
+  width: 728,
+  height: 720,
+  tbr: 2176,
+  filesize_approx: 4212736,
+};
+
+// Instagram: portrait DASH renditions use height 1280 but the UI quality is
+// the short side (720p).
+const igVideo720 = {
+  format_id: "dash-331826349953647v",
+  ext: "mp4",
+  protocol: "https",
+  vcodec: "avc1.4d401f",
+  acodec: "none",
+  width: 720,
+  height: 1280,
+  tbr: 1795.641,
+};
+
+const igVideo426Low = {
+  format_id: "dash-1713210415886091v",
+  ext: "mp4",
+  protocol: "https",
+  vcodec: "avc1.4d401f",
+  acodec: "none",
+  width: 240,
+  height: 426,
+  tbr: 122.687,
+};
+
+const igVideo426High = {
+  format_id: "dash-1561138118163125v",
+  ext: "mp4",
+  protocol: "https",
+  vcodec: "avc1.4d401f",
+  acodec: "none",
+  width: 240,
+  height: 426,
+  tbr: 232.283,
+};
+
+const igAudio131 = {
+  format_id: "dash-1254645688899587a",
+  ext: "m4a",
+  protocol: "https",
+  vcodec: "none",
+  acodec: "mp4a.40.2",
+  abr: 131.525,
 };
 
 // ---------------------------------------------------------------------------
@@ -221,6 +300,57 @@ test("buildVideoFormats uses filesize when yt-dlp reports it", () => {
 });
 
 // ---------------------------------------------------------------------------
+// buildGenericVideoFormats (X / Instagram)
+// ---------------------------------------------------------------------------
+
+test("buildGenericVideoFormats returns [] for empty/invalid input", () => {
+  assert.deepEqual(buildGenericVideoFormats([]), []);
+  assert.deepEqual(buildGenericVideoFormats(null), []);
+  assert.deepEqual(buildGenericVideoFormats(undefined), []);
+});
+
+test("buildGenericVideoFormats prefers X's muxed progressive MP4", () => {
+  const plans = buildGenericVideoFormats([xAudio128, xHls720Video, xProgressive720]);
+  assert.equal(plans.length, 1);
+
+  const plan = plans[0];
+  assert.equal(plan.height, 720);
+  assert.equal(plan.label, "720p");
+  assert.equal(plan.kind, "progressive");
+  assert.equal(plan.hasAudio, true);
+  assert.equal(plan.formatId, "http-2176");
+  assert.deepEqual(plan.formatIds, ["http-2176"]);
+  assert.equal(plan.estimatedSize, 4212736);
+  assert.equal(plan.selectors[0], "http-2176");
+});
+
+test("buildGenericVideoFormats merges Instagram DASH video with audio", () => {
+  const plans = buildGenericVideoFormats([igVideo426Low, igVideo426High, igVideo720, igAudio131]);
+  assert.deepEqual(
+    plans.map((p) => p.height),
+    [720, 240]
+  );
+
+  const plan = plans[0];
+  assert.equal(plan.kind, "merge");
+  assert.equal(plan.hasAudio, true);
+  assert.deepEqual(plan.formatIds, ["dash-331826349953647v", "dash-1254645688899587a"]);
+  assert.equal(plan.selectors[0], "dash-331826349953647v+dash-1254645688899587a");
+
+  // At the same short-side quality, use the higher-bitrate rendition.
+  const at240 = plans.find((p) => p.height === 240);
+  assert.equal(at240.formatIds[0], "dash-1561138118163125v");
+});
+
+test("buildGenericVideoFormats keeps silent posts downloadable without audio", () => {
+  const [plan] = buildGenericVideoFormats([igVideo720]);
+  assert.equal(plan.kind, "video");
+  assert.equal(plan.hasAudio, false);
+  assert.deepEqual(plan.formatIds, ["dash-331826349953647v"]);
+  assert.deepEqual(plan.selectors, ["dash-331826349953647v", "best"]);
+});
+
+// ---------------------------------------------------------------------------
 // Audio options / source selection
 // ---------------------------------------------------------------------------
 
@@ -258,6 +388,23 @@ test("pickAudioSource falls back to HE-AAC HLS then DASH audio", () => {
   assert.equal(pickAudioSource([]), null);
 });
 
+test("pickAudioSource handles X's audio-only HLS and Instagram DASH audio", () => {
+  const fromX = pickAudioSource([xAudio128]);
+  assert.equal(fromX.formatId, "hls-audio-128000-Audio");
+  assert.match(fromX.label, /HLS audio \(128k\)/);
+
+  const fromInstagram = pickAudioSource([igAudio131]);
+  assert.equal(fromInstagram.formatId, "dash-1254645688899587a");
+  assert.match(fromInstagram.label, /DASH audio \(132k\)/);
+});
+
+test("pickAudioSource falls back to a muxed rendition when no audio-only format exists", () => {
+  const source = pickAudioSource([progressive18]);
+  assert.equal(source.formatId, "18");
+  assert.equal(source.height, 360);
+  assert.match(source.label, /Muxed audio \(360p\)/);
+});
+
 // ---------------------------------------------------------------------------
 // classifyYtDlpError
 // ---------------------------------------------------------------------------
@@ -283,6 +430,15 @@ test("classifyYtDlpError maps the datacenter-IP bot check to 502", () => {
 test("classifyYtDlpError maps format errors to 400 and unknown errors to 500", () => {
   assert.equal(classifyYtDlpError("ERROR: Requested format is not available", 1).status, 400);
   assert.equal(classifyYtDlpError("ERROR: something totally unexpected", 1).status, 500);
+
+  const noVideo = classifyYtDlpError("ERROR: [Instagram] DaBUYYOjNgA: No video formats found!", 1);
+  assert.equal(noVideo.status, 400);
+  assert.match(noVideo.message, /No downloadable video/i);
+
+  assert.equal(
+    classifyYtDlpError("ERROR: [Instagram] rate-limit reached, please try again later", 1).status,
+    429
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -363,6 +519,26 @@ test("buildVideoAttempts supports the legacy raw formatId selection", () => {
   assert.ok(attempts.some((a) => /^bestvideo.*\+bestaudio/.test(a.selector)));
 });
 
+test("buildVideoAttempts keeps X and Instagram attempts free of YouTube flags", () => {
+  const [xPlan] = buildGenericVideoFormats([xAudio128, xHls720Video, xProgressive720]);
+  const xAttempts = buildVideoAttempts({ plan: xPlan, height: 720, platform: "x" });
+  assert.equal(xAttempts[0].selector, "http-2176");
+  assert.equal(xAttempts[1].selector, "http-2176");
+  assert.ok(xAttempts.every((a) => !a.extractorArgs));
+  assert.ok(xAttempts.every((a) => !a.selector.includes("player_client")));
+  assert.ok(xAttempts.length <= 9);
+
+  const [igPlan] = buildGenericVideoFormats([igVideo720, igAudio131]);
+  const igAttempts = buildVideoAttempts({ plan: igPlan, height: 720, platform: "instagram" });
+  assert.equal(igAttempts[0].selector, "dash-331826349953647v+dash-1254645688899587a");
+  assert.deepEqual(igAttempts[0].merge, {
+    videoSelector: "dash-331826349953647v",
+    audioSelector: "dash-1254645688899587a",
+  });
+  assert.deepEqual(igAttempts[1].merge, igAttempts[0].merge);
+  assert.ok(igAttempts.every((a) => !a.extractorArgs));
+});
+
 test("every video plan's selector chain ends with a video+audio merge", () => {
   const muxed = buildVideoFormats([hls93, dashAudio140])[0];
   assert.equal(muxed.kind, "muxed");
@@ -406,6 +582,17 @@ test("buildAudioAttempts works without a detected source", () => {
   assert.ok(attempts[0].selector.includes("bestaudio"));
 });
 
+test("buildAudioAttempts uses platform sources without YouTube player flags", () => {
+  const xAttempts = buildAudioAttempts({ sourceFormatId: "hls-audio-128000-Audio", platform: "x" });
+  assert.equal(xAttempts[0].selector, "hls-audio-128000-Audio/bestaudio/best");
+  assert.equal(xAttempts[1].selector, xAttempts[0].selector);
+  assert.ok(xAttempts.every((a) => !a.extractorArgs));
+
+  const igAttempts = buildAudioAttempts({ sourceFormatId: "dash-1254645688899587a", platform: "instagram" });
+  assert.equal(igAttempts[0].selector, "dash-1254645688899587a/bestaudio/best");
+  assert.ok(igAttempts.every((a) => !a.extractorArgs));
+});
+
 // ---------------------------------------------------------------------------
 // isFatalDownloadError
 // ---------------------------------------------------------------------------
@@ -414,6 +601,9 @@ test("isFatalDownloadError marks unavailable/private videos as fatal but not 403
   assert.equal(isFatalDownloadError("ERROR: Video unavailable"), true);
   assert.equal(isFatalDownloadError("ERROR: Private video. Sign in if you've been granted access"), true);
   assert.equal(isFatalDownloadError("ERROR: Sign in to confirm your age"), true);
+  assert.equal(isFatalDownloadError("ERROR: [Instagram] Requested content is not available"), true);
+  assert.equal(isFatalDownloadError("ERROR: [twitter] Tweet not found"), true);
+  assert.equal(isFatalDownloadError("ERROR: rate-limit reached"), true);
 
   // Blocked media URLs and missing formats must stay retryable.
   assert.equal(isFatalDownloadError("ERROR: unable to download video data: HTTP Error 403: Forbidden"), false);

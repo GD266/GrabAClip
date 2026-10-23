@@ -25,11 +25,11 @@ router.get("/", async (req, res) => {
     return res.status(400).json({ error: validation.error });
   }
 
-  const { normalizedUrl, height, formatId } = validation;
+  const { normalizedUrl, height, formatId, platform } = validation;
 
   // Prevent duplicate active downloads for same video
   if (isActive("video", normalizedUrl)) {
-    return res.status(429).json({ error: "A download for this video is already in progress. Please wait or refresh the page." });
+    return res.status(429).json({ error: "A download for this link is already in progress. Please wait or refresh the page." });
   }
 
   startDownload("video", normalizedUrl);
@@ -96,7 +96,7 @@ router.get("/", async (req, res) => {
     plan = planSet.find((f) => f.height === height) || null;
     if (!plan) {
       const available = planSet.map((f) => f.label).join(", ") || "none";
-      const message = `${height}p is not available for this video. Available qualities: ${available}.`;
+      const message = `${height}p is not available for this link. Available qualities: ${available}.`;
       failDownload("video", normalizedUrl, message);
       return res.status(400).json({ error: message });
     }
@@ -105,8 +105,8 @@ router.get("/", async (req, res) => {
   }
 
   // Ordered fallback chain: preferred source -> fresh retry -> safer
-  // selectors -> alternate YouTube player clients.
-  const attempts = buildVideoAttempts({ plan, height, formatId });
+  // selectors -> alternate YouTube player clients (YouTube only).
+  const attempts = buildVideoAttempts({ plan, height, formatId, platform });
 
   setPhase("video", normalizedUrl, "processing");
   setProgressDetail("video", normalizedUrl, 0, attempts[0]?.note || "Starting download…");
@@ -152,18 +152,22 @@ router.get("/", async (req, res) => {
           videoSelector: attempt.merge.videoSelector,
           audioSelector: attempt.merge.audioSelector,
           extractorArgs: attempt.extractorArgs || null,
+          playlistItem: info._playlistItem || null,
           videoSize: plan?.videoSize,
           audioSize: plan?.audioSize,
         });
       }
-      return startVideoDownload(normalizedUrl, attempt);
+      return startVideoDownload(normalizedUrl, {
+        ...attempt,
+        playlistItem: info._playlistItem || null,
+      });
     },
-    onProgress: (pct) => setProgressDetail("video", normalizedUrl, pct, `Downloading from YouTube… ${Math.round(pct)}%`),
+    onProgress: (pct) => setProgressDetail("video", normalizedUrl, pct, `Downloading media… ${Math.round(pct)}%`),
     onDetail: (text) => setProgressDetail("video", normalizedUrl, null, text),
     signal: jobController.signal,
-    // A video download must always contain audio; the runner verifies the
-    // file and falls back to another source instead of delivering silence.
-    requireAudio: true,
+    // A video download must always contain audio when the source has an
+    // audio track. X/Instagram silent clips are marked hasAudio:false.
+    requireAudio: plan ? plan.hasAudio !== false : true,
   });
 
   if (clientGone || result.aborted) {

@@ -4,12 +4,13 @@ import { getAIProvider } from "./ai/factory.js";
 import { isYouTubeUrl, normalizeYouTubeUrl } from "../utils/validation.js";
 
 /**
- * Build intelligence for a YouTube video
- * Returns structured JSON, never fails entire request if optional parts unavailable
+ * Build intelligence for a YouTube video.
+ * Returns structured JSON, never fails the entire request if optional parts
+ * are unavailable. Transcript/AI intelligence is intentionally YouTube-only.
  */
 export async function buildIntelligence(rawUrl) {
   if (!isYouTubeUrl(rawUrl)) {
-    const err = new Error("Invalid YouTube URL. Please provide a valid YouTube video URL.");
+    const err = new Error("Intelligence is available for YouTube links only.");
     err.status = 400;
     throw err;
   }
