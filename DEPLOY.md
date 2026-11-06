@@ -148,7 +148,9 @@ others work fine. X/Twitter and Instagram can also require a signed-in session
 or rate-limit anonymous requests. The backend passes one cookie file to all
 info/download calls, so you can include several sites in the same cookie export.
 
-1. Sign in to the platform in a desktop browser.
+1. Sign in to the platform in a desktop browser. For YouTube, do **not** export
+   from a normal tab you keep open — see [YouTube cookie rotation](#youtube-cookie-rotation)
+   below.
 2. Export a **Netscape-format** `cookies.txt` for `youtube.com`, `x.com` /
    `twitter.com`, or `instagram.com` (e.g. with a "Get cookies.txt LOCALLY"
    style browser extension). Multiple domains can live in one file.
@@ -179,6 +181,8 @@ Notes:
   `#HttpOnly_` lines are supported.
 - Cookies expire and can be rotated by the browser. Re-export when
   `hasYouTubeAuth` is missing or requests start failing again.
+  `hasYouTubeAuth: true` only means the auth cookie names are present, not that
+  YouTube still accepts the session.
 - `YTDLP_COOKIES_FILE` that is group/world readable triggers a diagnostics
   warning; run `chmod 600 cookies.txt` on the server.
 - YouTube `getVideoInfo` retries with the `web_safari`, `web_embedded` and
@@ -188,6 +192,22 @@ Notes:
   required" needs cookies.
 - Instagram often rejects anonymous extraction from datacenter IPs even when
   the post is public. Cookies help, but accounts can still be challenged.
+
+### YouTube cookie rotation
+
+YouTube rotates account cookies while a YouTube tab is open, so an export from
+a normal browser session can stop working within minutes. Export from an
+isolated private/incognito window instead:
+
+1. Open a new private/incognito window and sign in to YouTube.
+2. In that same tab, open `https://www.youtube.com/robots.txt` and keep it as
+   the only private tab.
+3. Export the `youtube.com` cookies in Netscape format.
+4. Close the private window immediately and do not reopen YouTube in it.
+
+Do not use yt-dlp's `--cookies-from-browser` to create the file; it copies the
+regular browser session, not the isolated private one. The app always passes
+the exported file with `--cookies`.
 
 ## Troubleshooting a deployed backend
 
@@ -221,8 +241,17 @@ Notes:
   `/api/health` returning 200 only proves the Node process is alive — it does
   not mean YouTube accepts the host's IP. IP reputation is outside the app's
   control; cookies from a signed-in account are the supported workaround.
+- "The source platform is still asking this server to verify it isn't a bot,
+  even though cookies are configured" means yt-dlp could read the cookie file
+  but YouTube did not accept the session. `hasYouTubeAuth: true` only proves
+  the cookie names exist; it does not prove the session is still valid.
+  Re-export a fresh Netscape cookie file from a signed-in browser, update
+  `YTDLP_COOKIES_B64`, restart, and retry. If it still fails, the account or
+  the host IP is flagged.
 - "The configured cookies were rejected or have expired" means the export is
-  stale or was rotated by the browser. Re-export and update the secret.
+  stale or was rotated by the browser. The app keeps yt-dlp warnings enabled so
+  this is detected from yt-dlp's rotated-cookie warning; re-export and update
+  the secret.
 - Rebuild the image after pulling new commits: the Dockerfile verifies the
   binaries and the pinned yt-dlp version during the build. On Render use
   **Manual Deploy → Clear build cache & deploy** if an old cached layer still

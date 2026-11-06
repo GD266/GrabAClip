@@ -425,7 +425,34 @@ test("classifyYtDlpError maps unavailable/private/age-restricted videos", () => 
 test("classifyYtDlpError maps the datacenter-IP bot check to 502", () => {
   const r = classifyYtDlpError("ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies for the authentication.", 1);
   assert.equal(r.status, 502);
+  assert.equal(r.code, "BOT_CHECK");
   assert.match(r.message, /verify it isn't a bot/i);
+  assert.match(r.message, /Add cookies/i);
+});
+
+test("classifyYtDlpError distinguishes stale cookies from a bare bot check", () => {
+  // With warnings enabled, yt-dlp's rotated-cookie warning is the real cause
+  // and must win over the generic bot-check text that follows it.
+  const stale = classifyYtDlpError(
+    "WARNING: [youtube] The provided YouTube account cookies are no longer valid. " +
+      "They have likely been rotated in the browser.\n" +
+      "ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies for the authentication.",
+    1
+  );
+  assert.equal(stale.code, "COOKIES_INVALID");
+  assert.match(stale.message, /Re-export/i);
+
+  // Valid-looking cookies can still be rejected by the host IP. Don't tell the
+  // user to add cookies they already configured.
+  const configured = classifyYtDlpError(
+    "ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies for the authentication.",
+    1,
+    { cookiesConfigured: true }
+  );
+  assert.equal(configured.code, "BOT_CHECK");
+  assert.match(configured.message, /stale or rotated/i);
+  assert.match(configured.message, /Re-export/i);
+  assert.doesNotMatch(configured.message, /Add cookies/i);
 });
 
 test("classifyYtDlpError maps format errors to 400 and unknown extraction errors to 502", () => {

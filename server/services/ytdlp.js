@@ -141,7 +141,10 @@ export const MIME_BY_EXT = {
 };
 
 // Shared yt-dlp flags for info/report style calls (no media transferred).
-const YTDLP_QUIET_FLAGS = ["--no-playlist", "--remote-components", "ejs:github", "--no-warnings", "--no-progress", ...cookiesFlags()];
+// `--no-warnings` is intentionally absent: yt-dlp reports stale/rotated
+// cookies as a warning, and suppressing it hid the real cause behind a
+// generic bot-check error. Warnings go to stderr; the JSON payload is stdout.
+const YTDLP_QUIET_FLAGS = ["--no-playlist", "--remote-components", "ejs:github", "--no-progress", ...cookiesFlags()];
 
 // Flags for media jobs: progress lines are parsed to feed the UI status.
 // Note: the "download:" prefix of --progress-template is the template TYPE,
@@ -150,7 +153,6 @@ const YTDLP_JOB_FLAGS = [
   "--no-playlist",
   "--remote-components",
   "ejs:github",
-  "--no-warnings",
   "--newline",
   // Pull HLS/DASH fragments in parallel: single YouTube connections are
   // bandwidth-throttled, and multi-fragment downloads are much faster for
@@ -188,9 +190,10 @@ export const AUDIO_OPTIONS = [
 export const AUDIO_FORMAT_IDS = new Set(["m4a", "mp3", "wav", "best", "aac", "high", "opus"]);
 export const AUDIO_MP3_QUALITIES = new Set([320, 192, 128]);
 
-export function classifyYtDlpError(stderr, code) {
+export function classifyYtDlpError(stderr, code, options = {}) {
   const lower = (stderr || "").toLowerCase();
   const text = String(stderr || "").trim();
+  const hasCookies = options.cookiesConfigured ?? Boolean(COOKIES.configured);
 
   // Timeouts must be checked before the generic network branch: a process that
   // hit the /api/info deadline should return 504, not an unhelpful 502.
@@ -284,14 +287,16 @@ export function classifyYtDlpError(stderr, code) {
   }
 
   // Datacenter-IP bot check ("Sign in to confirm you're not a bot"). The info
-  // fetcher retries alternate player clients before this surfaces; a signed-in
-  // cookie file is the reliable fix.
+  // fetcher retries alternate player clients before this surfaces. Cookies are
+  // the reliable fix, but if they are already configured they may be stale or
+  // the account/IP may be flagged; don't tell the user to "add cookies" again.
   if (lower.includes("not a bot")) {
     return {
       status: 502,
       code: "BOT_CHECK",
-      message:
-        "The source platform is asking this server to verify it isn't a bot. Add cookies to the backend (YTDLP_COOKIES_B64, see DEPLOY.md) or try another link.",
+      message: hasCookies
+        ? "The source platform is still asking this server to verify it isn't a bot, even though cookies are configured. The cookie export is probably stale or rotated, or the host IP is flagged. Re-export the YouTube cookies, update YTDLP_COOKIES_B64, and restart; or try another link."
+        : "The source platform is asking this server to verify it isn't a bot. Add cookies to the backend (YTDLP_COOKIES_B64, see DEPLOY.md) or try another link.",
     };
   }
   // Age-restricted / authentication required — must be checked before generic 403
