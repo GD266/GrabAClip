@@ -43,13 +43,14 @@ router.post("/", async (req, res) => {
   } catch (e) {
     const status = e.status || 500;
     const message = e.message || "Failed to retrieve video information.";
+    const code = typeof e.code === "string" ? e.code : undefined;
 
     // Do not expose stack / internal details
     // Log server side
     console.error(`[info] error for ${validation.normalizedUrl}:`, e.original || e.message);
     recordError("info", e.original ? new Error(`${message} :: ${e.original}`) : e);
 
-    return res.status(status).json({ error: message });
+    return res.status(status).json({ error: message, ...(code ? { code } : {}) });
   }
 });
 

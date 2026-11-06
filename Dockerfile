@@ -20,10 +20,18 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg python3 python3-pip \
  && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp from PyPI. The standalone GitHub release asset can be blocked
-# or served as a non-binary page by CI proxies; pip is reliable. The build stops
-# here if the installed binary cannot run.
-RUN python3 -m pip install --no-cache-dir --break-system-packages -U yt-dlp \
+# Install a pinned, tested yt-dlp from PyPI. The standalone GitHub release
+# asset can be blocked or served as a non-binary page by CI proxies; pip is
+# reliable. 2026.10.21 is the first release that stopped using YouTube's
+# broken `tv_downgraded` client for signed-in playback ("The page needs to be
+# reloaded."); 2026.10.26 is the current stable. The [default] extra includes
+# yt-dlp-ejs, which is required for YouTube's JavaScript challenges.
+#
+# Keep the version pinned so a Render/Railway rebuild cannot silently keep an
+# old cached layer. Override with --build-arg YTDLP_VERSION=... if needed.
+ARG YTDLP_VERSION=2026.10.26
+RUN python3 -m pip install --no-cache-dir --break-system-packages "yt-dlp[default]==${YTDLP_VERSION}" \
+ && test "$(yt-dlp --version)" = "${YTDLP_VERSION}" \
  && yt-dlp --version
 
 COPY --from=deno /deno /usr/local/bin/deno

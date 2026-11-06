@@ -188,7 +188,11 @@ router.get("/", async (req, res) => {
     recordError("download", new Error(`${classified.message} :: ${stderr.slice(0, 400)}`));
     failDownload("video", normalizedUrl, classified.message);
     if (!res.headersSent && !res.writableEnded) {
-      res.status(classified.status).json({ error: classified.message, details: stderr.slice(0, 300) });
+      res.status(classified.status).json({
+        error: classified.message,
+        ...(classified.code ? { code: classified.code } : {}),
+        details: stderr.slice(0, 300),
+      });
     } else if (!res.writableEnded) {
       res.end();
     }

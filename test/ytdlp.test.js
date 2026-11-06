@@ -16,6 +16,7 @@ import {
   buildVideoAttempts,
   buildAudioAttempts,
   isFatalDownloadError,
+  isYtDlpVersionSupported,
   runMediaJob,
   startVideoDownload,
   cleanupJobDir,
@@ -427,9 +428,10 @@ test("classifyYtDlpError maps the datacenter-IP bot check to 502", () => {
   assert.match(r.message, /verify it isn't a bot/i);
 });
 
-test("classifyYtDlpError maps format errors to 400 and unknown errors to 500", () => {
+test("classifyYtDlpError maps format errors to 400 and unknown extraction errors to 502", () => {
   assert.equal(classifyYtDlpError("ERROR: Requested format is not available", 1).status, 400);
-  assert.equal(classifyYtDlpError("ERROR: something totally unexpected", 1).status, 500);
+  assert.equal(classifyYtDlpError("ERROR: something totally unexpected", 1).status, 502);
+  assert.equal(classifyYtDlpError("", 1).status, 500);
 
   const noVideo = classifyYtDlpError("ERROR: [Instagram] DaBUYYOjNgA: No video formats found!", 1);
   assert.equal(noVideo.status, 400);
@@ -439,6 +441,51 @@ test("classifyYtDlpError maps format errors to 400 and unknown errors to 500", (
     classifyYtDlpError("ERROR: [Instagram] rate-limit reached, please try again later", 1).status,
     429
   );
+});
+
+test("classifyYtDlpError explains YouTube page-reload and cookie failures", () => {
+  const pageReload = classifyYtDlpError(
+    "ERROR: [youtube] dQw4w9WgXcQ: The page needs to be reloaded.",
+    1
+  );
+  assert.equal(pageReload.status, 502);
+  assert.equal(pageReload.code, "YOUTUBE_PAGE_RELOAD");
+  assert.match(pageReload.message, /2026\.10\.21/);
+
+  const staleCookies = classifyYtDlpError(
+    "ERROR: The provided YouTube account cookies are no longer valid. They have likely been rotated in the browser.",
+    1
+  );
+  assert.equal(staleCookies.status, 502);
+  assert.equal(staleCookies.code, "COOKIES_INVALID");
+  assert.match(staleCookies.message, /Re-export/i);
+
+  const jsChallenge = classifyYtDlpError(
+    "WARNING: Only images are available. Please install the yt-dlp-ejs package or use --extractor-args",
+    1
+  );
+  assert.equal(jsChallenge.status, 502);
+  assert.equal(jsChallenge.code, "YOUTUBE_JS_CHALLENGE");
+  assert.match(jsChallenge.message, /Deno/);
+});
+
+test("classifyYtDlpError returns 504 for timeouts before generic network errors", () => {
+  const direct = classifyYtDlpError("ERROR: The read operation timed out", 1);
+  assert.equal(direct.status, 504);
+  assert.equal(direct.code, "TIMEOUT");
+
+  const networkTimeout = classifyYtDlpError("ERROR: network timeout while contacting host", 1);
+  assert.equal(networkTimeout.status, 504);
+});
+
+test("isYtDlpVersionSupported enforces the minimum YouTube-safe release", () => {
+  assert.equal(isYtDlpVersionSupported("2026.10.26"), true);
+  assert.equal(isYtDlpVersionSupported("2026.10.21"), true);
+  assert.equal(isYtDlpVersionSupported("2026.10.20"), false);
+  assert.equal(isYtDlpVersionSupported("2026.08.19"), false);
+  assert.equal(isYtDlpVersionSupported("2027.1.1"), true);
+  assert.equal(isYtDlpVersionSupported(null), null);
+  assert.equal(isYtDlpVersionSupported("not-a-version"), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -508,7 +555,9 @@ test("buildVideoAttempts ends with alternate YouTube player clients", () => {
   const attempts = buildVideoAttempts({ height: 720 });
   const clients = attempts.flatMap((a) => a.extractorArgs || []);
   assert.ok(clients.some((c) => c.includes("web_safari")));
-  assert.ok(clients.some((c) => c.includes("player_client=tv")));
+  assert.ok(clients.some((c) => c.includes("player_client=tv_samsung")));
+  // `tv`/`tv_downgraded` are the broken signed-in clients (yt-dlp #17389).
+  assert.ok(!clients.some((c) => c === "youtube:player_client=tv" || c === "youtube:player_client=tv_downgraded"));
 });
 
 test("buildVideoAttempts supports the legacy raw formatId selection", () => {
@@ -574,6 +623,7 @@ test("buildAudioAttempts tries the preferred source, then audio-only and player 
   assert.equal(attempts[1].selector, attempts[0].selector);
   assert.ok(attempts.some((a) => a.selector.startsWith("bestaudio")));
   assert.ok(attempts.some((a) => (a.extractorArgs || []).some((c) => c.includes("web_safari"))));
+  assert.ok(attempts.some((a) => (a.extractorArgs || []).some((c) => c.includes("tv_samsung"))));
 });
 
 test("buildAudioAttempts works without a detected source", () => {

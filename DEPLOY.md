@@ -59,8 +59,33 @@ Quick host notes:
 
 No `GAC_API_BASE` is needed in this setup: the frontend and API share an origin.
 
-> Keep the image up to date (redeploy/rebuild periodically). A stale `yt-dlp`
-> is the most common reason downloads start failing with HTTP 403.
+### YouTube: "The page needs to be reloaded."
+
+yt-dlp **2026.10.21** is the minimum supported release. Older binaries use
+YouTube's `tv_downgraded` client by default for signed-in playback, which
+YouTube now rejects with this exact error (yt-dlp issue #17389). The fix landed
+in 2026.10.21; the current stable at the time of writing is **2026.10.26**.
+
+The `Dockerfile` pins `yt-dlp[default]==2026.10.26` and fails the build unless
+`yt-dlp --version` matches. After deploying:
+
+1. `GET https://<backend>/api/health` must show
+   `"ytDlpVersion": "2026.10.26"` and `"ytDlpSupported": true`.
+2. If it still shows an older version, use **Manual Deploy → Clear build
+   cache & deploy** on Render. A normal redeploy can reuse the cached pip
+   layer and keep the old binary.
+3. `ytDlpSupported: false` (or a `warning` field) means the container is still
+   running an outdated binary. Fix that before debugging YouTube further.
+
+For local development, install or update the same extra:
+
+```bash
+python -m pip install -U "yt-dlp[default]"
+yt-dlp --version   # must be >= 2026.10.21
+```
+
+A stale yt-dlp is also the most common cause of YouTube media URLs failing
+with HTTP 403 after the info step succeeds.
 
 ---
 
@@ -133,41 +158,75 @@ info/download calls, so you can include several sites in the same cookie export.
    - macOS/Linux: `base64 -w0 cookies.txt`
 4. On the backend host set `YTDLP_COOKIES_B64` to the encoded value (Render:
    Environment → Add Environment Variable → mark it secret).
-   `YTDLP_COOKIES_FILE` pointing at a mounted `cookies.txt` also works.
-5. Redeploy/restart, then verify `GET /api/health?diagnostics=1` reports
-   `cookies: { configured: true, ... }` (the startup log prints it too).
+   `YTDLP_COOKIES_FILE` pointing at a mounted `cookies.txt` also works and wins
+   when it points at a valid file. Use one source, not both.
+5. Redeploy/restart, then verify `GET /api/health?diagnostics=1` (and the
+   startup log) reports the cookie metadata:
+   - `cookies.configured: true` and `cookies.source: "base64" | "file"`
+   - `cookies.count` and `cookies.domains` (for example `youtube.com`, `x.com`)
+   - `cookies.hasYouTubeAuth: true` when a signed-in YouTube cookie is present
+   - `cookies.mode` / `cookies.size` (a `YTDLP_COOKIES_FILE` should be `0600`)
+   - `cookies.warning` / `cookies.error` if the file is missing, malformed,
+     not Netscape format, or unreadable
+
+Cookie values are never logged or returned by the API. Only counts, domains and
+presence flags are exposed.
 
 Notes:
 
 - Use throwaway accounts; cookies are credentials. Never commit them.
-- Cookies expire eventually — re-export when those posts start failing again.
-- YouTube `getVideoInfo` retries with the `web_safari`/`tv` player clients
-  before giving up; X/Instagram have no equivalent player flag, so a public
-  post that returns "login required" needs cookies.
+- Use a **Netscape-format** export (tab-separated lines), not a JSON export.
+  `#HttpOnly_` lines are supported.
+- Cookies expire and can be rotated by the browser. Re-export when
+  `hasYouTubeAuth` is missing or requests start failing again.
+- `YTDLP_COOKIES_FILE` that is group/world readable triggers a diagnostics
+  warning; run `chmod 600 cookies.txt` on the server.
+- YouTube `getVideoInfo` retries with the `web_safari`, `web_embedded` and
+  `tv_samsung` player clients before giving up. It no longer uses the broken
+  `tv`/`tv_downgraded` clients. X/Instagram have no equivalent player flag;
+  they get one fresh extraction retry, and a public post that returns "login
+  required" needs cookies.
 - Instagram often rejects anonymous extraction from datacenter IPs even when
   the post is public. Cookies help, but accounts can still be challenged.
 
 ## Troubleshooting a deployed backend
 
+- **`ERROR: [youtube] ... The page needs to be reloaded.`** — the container is
+  running yt-dlp older than 2026.10.21. Check `/api/health`: if
+  `ytDlpSupported` is `false`, clear the Render build cache and redeploy (see
+  the section above). If the version is current, the error usually means the
+  cookie export was rejected; re-export it and check `cookies.hasYouTubeAuth`.
 - `GET https://<backend>/api/health` — `ytDlpVersion: null` means yt-dlp is not
   runnable in the container (missing binary, wrong architecture, permission).
+  `ytDlpSupported: false` means the binary is runnable but too old for
+  YouTube's current clients.
 - `GET https://<backend>/api/health?diagnostics=1` — shows the resolved path,
   exit code and stderr for yt-dlp, ffmpeg and deno, the container memory limit,
-  `lowMemoryHost`/`sequentialMerge`, `uptimeSeconds` and `recentErrors`.
+  `lowMemoryHost`/`sequentialMerge`, cookie metadata, `warnings`,
+  `uptimeSeconds` and `recentErrors`.
+- **`POST /api/info` now fails within ~45 seconds instead of hanging.** Each
+  player/extraction attempt is capped at 20 seconds and the whole lookup at 45
+  seconds; a timeout returns **504** with `code: "TIMEOUT"`. Other API errors
+  include a `code` field (for example `YOUTUBE_PAGE_RELOAD`, `COOKIES_INVALID`,
+  `BOT_CHECK`, `MEDIA_403`), which makes the cause visible without reading
+  server logs.
 - A download that dies with a bare 502 from the host (no CORS headers, status
   polling suddenly returns invalid JSON) usually means the container was
   killed. On a 512 MB instance the likely cause is memory: the image
   automatically switches to a single yt-dlp process and 2 fragments. Check
   `lowMemoryHost` in the diagnostics; force it with `GAC_LOW_MEMORY=1`.
-- `POST /api/info` returning the generic "Failed to retrieve video information.
-  Please try again." usually means yt-dlp failed to start or the platform
-  blocked the request; check the diagnostics first.
 - "The source platform is asking this server to verify it isn't a bot" means
   the platform demands a signed-in session from a datacenter IP. Configure
   cookies (see the section above); other posts keep working without them.
+  `/api/health` returning 200 only proves the Node process is alive — it does
+  not mean YouTube accepts the host's IP. IP reputation is outside the app's
+  control; cookies from a signed-in account are the supported workaround.
+- "The configured cookies were rejected or have expired" means the export is
+  stale or was rotated by the browser. Re-export and update the secret.
 - Rebuild the image after pulling new commits: the Dockerfile verifies the
-  binaries during the build. On Render use **Manual Deploy → Clear build cache &
-  deploy** if an old cached layer still lacks yt-dlp.
+  binaries and the pinned yt-dlp version during the build. On Render use
+  **Manual Deploy → Clear build cache & deploy** if an old cached layer still
+  contains an older yt-dlp.
 
 ---
 

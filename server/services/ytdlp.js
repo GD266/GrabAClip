@@ -6,14 +6,31 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { isSupportedMediaUrl, detectPlatform, normalizeMediaUrl } from "../utils/validation.js";
 import { getRecentErrors } from "../utils/errorLog.js";
+import { resolveCookies, COOKIE_TEMP_ROOT } from "../utils/cookies.js";
 
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
-const INFO_TIMEOUT_MS = 30000; // 30s
+
+// Per-attempt and overall budgets for /api/info. The old setup allowed four
+// 30s attempts (~120s worst case); Render requests were observed hanging for
+// ~95s before returning a generic 500. A slow first extraction still gets a
+// second chance, but the whole lookup is now bounded.
+const INFO_TIMEOUT_MS = 20000; // 20s per player/extraction attempt
+const INFO_TOTAL_TIMEOUT_MS = 45000; // hard ceiling across all attempts
+const INFO_RETRY_DELAY_MS = 250;
 const DOWNLOAD_TIMEOUT_MS = 1200000; // 20min (1080p HLS can be large + slow links)
 
 // Temp workspace for media jobs. yt-dlp needs a real file so it can run its
 // HLS (TS -> MP4) fixup, merge video+audio into MP4, and postprocess audio.
-const TEMP_ROOT = path.join(os.tmpdir(), "grabaclip");
+const TEMP_ROOT = COOKIE_TEMP_ROOT;
+
+/**
+ * yt-dlp 2026.10.21 is the first stable release that no longer uses the
+ * YouTube `tv_downgraded` client as a default for signed-in extraction. On
+ * older versions YouTube answers it with "The page needs to be reloaded."
+ * (yt-dlp issue #17389), which made every request from a cookie-enabled
+ * datacenter host fail.
+ */
+export const MIN_YTDLP_VERSION = "2026.10.21";
 
 /**
  * Optional platform cookies. Datacenter IPs (Render, Railway, Fly, VPS) are
@@ -24,40 +41,52 @@ const TEMP_ROOT = path.join(os.tmpdir(), "grabaclip");
  *   YTDLP_COOKIES_FILE  path to a Netscape-format cookies.txt
  *   YTDLP_COOKIES_B64   base64 of that file (for hosts without file uploads)
  */
-function resolveCookiesFile() {
-  const explicit = String(process.env.YTDLP_COOKIES_FILE || "").trim();
-  if (explicit) {
-    try {
-      if (fs.statSync(explicit).isFile()) return { path: explicit, source: "file" };
-    } catch {}
-  }
+const COOKIES = resolveCookies();
 
-  const encoded = String(process.env.YTDLP_COOKIES_B64 || "").trim();
-  if (encoded) {
-    try {
-      const content = Buffer.from(encoded, "base64").toString("utf8");
-      // Netscape cookies.txt files are tab separated; reject anything else so a
-      // mistyped env var cannot feed garbage to yt-dlp.
-      if (content.includes("\t")) {
-        fs.mkdirSync(TEMP_ROOT, { recursive: true });
-        const target = path.join(TEMP_ROOT, "cookies.txt");
-        fs.writeFileSync(target, content, { mode: 0o600 });
-        return { path: target, source: "base64" };
-      }
-    } catch {}
-  }
-  return null;
+/**
+ * Whether/how platform cookies are configured (diagnostics + startup log).
+ * Metadata only: cookie names and values are never exposed.
+ */
+export function getCookiesInfo() {
+  return {
+    configured: Boolean(COOKIES.configured),
+    source: COOKIES.source || null,
+    path: COOKIES.path || null,
+    count: COOKIES.count || 0,
+    domains: COOKIES.domains || [],
+    hasYouTube: Boolean(COOKIES.hasYouTube),
+    hasYouTubeAuth: Boolean(COOKIES.hasYouTubeAuth),
+    mode: COOKIES.mode ?? null,
+    size: COOKIES.size ?? null,
+    warning: COOKIES.warning || null,
+    error: COOKIES.error || null,
+  };
 }
 
-const COOKIES = resolveCookiesFile();
-
-/** Whether/how platform cookies are configured (diagnostics + startup log). */
-export function getCookiesInfo() {
-  return { configured: Boolean(COOKIES), source: COOKIES ? COOKIES.source : null };
+/** Args passed to every yt-dlp call when cookies are configured. */
+export function getCookiesArgs() {
+  return COOKIES.configured ? ["--cookies", COOKIES.path] : [];
 }
 
 function cookiesFlags() {
-  return COOKIES ? ["--cookies", COOKIES.path] : [];
+  return getCookiesArgs();
+}
+
+function versionParts(version) {
+  const match = String(version || "").match(/(\d{4})\.(\d{1,2})\.(\d{1,2})/);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/** Compare an installed yt-dlp version with the minimum supported release. */
+export function isYtDlpVersionSupported(version, minimum = MIN_YTDLP_VERSION) {
+  const installed = versionParts(version);
+  const required = versionParts(minimum);
+  if (!installed || !required) return null;
+  for (let i = 0; i < required.length; i += 1) {
+    if (installed[i] !== required[i]) return installed[i] > required[i];
+  }
+  return true;
 }
 
 /**
@@ -161,9 +190,34 @@ export const AUDIO_MP3_QUALITIES = new Set([320, 192, 128]);
 
 export function classifyYtDlpError(stderr, code) {
   const lower = (stderr || "").toLowerCase();
+  const text = String(stderr || "").trim();
+
+  // Timeouts must be checked before the generic network branch: a process that
+  // hit the /api/info deadline should return 504, not an unhelpful 502.
+  if (code === "TIMEOUT" || lower.includes("timed out") || lower.includes("timeout")) {
+    return {
+      status: 504,
+      code: "TIMEOUT",
+      message: "The source platform did not answer in time. Please try again in a minute.",
+    };
+  }
+
+  // A missing/broken yt-dlp is a server configuration problem, not a bad link.
+  if (
+    code === "ENOENT" ||
+    lower.includes("yt-dlp binary not found") ||
+    lower.includes("spawn yt-dlp") ||
+    lower.includes("enoent")
+  ) {
+    return {
+      status: 500,
+      code: "YTDLP_MISSING",
+      message: "yt-dlp is not installed or cannot run on the server. Check /api/health?diagnostics=1.",
+    };
+  }
 
   if (lower.includes("video unavailable") || lower.includes("this video is unavailable")) {
-    return { status: 404, message: "Video unavailable. It may have been removed or is not accessible." };
+    return { status: 404, code: "VIDEO_UNAVAILABLE", message: "Video unavailable. It may have been removed or is not accessible." };
   }
   if (
     lower.includes("tweet not found") ||
@@ -174,17 +228,68 @@ export function classifyYtDlpError(stderr, code) {
     lower.includes("post is unavailable") ||
     lower.includes("media not found")
   ) {
-    return { status: 404, message: "This post is unavailable or contains no downloadable video." };
+    return { status: 404, code: "POST_UNAVAILABLE", message: "This post is unavailable or contains no downloadable video." };
   }
   if (lower.includes("private video")) {
-    return { status: 403, message: "This video is private and cannot be downloaded." };
+    return { status: 403, code: "PRIVATE_VIDEO", message: "This video is private and cannot be downloaded." };
   }
+
+  // YouTube issue #17389: older yt-dlp releases asked the broken
+  // `tv_downgraded` client for signed-in playback and YouTube answered with
+  // this exact message. Fixed in yt-dlp 2026.10.21; cookies can also be stale.
+  if (lower.includes("the page needs to be reloaded") || lower.includes("page needs to be reloaded")) {
+    return {
+      status: 502,
+      code: "YOUTUBE_PAGE_RELOAD",
+      message:
+        'YouTube rejected the extraction request ("The page needs to be reloaded"). Update yt-dlp to 2026.10.21 or newer and re-export cookies if the problem persists.',
+    };
+  }
+
+  // Rotated/expired cookie export. yt-dlp reports these as warnings or errors
+  // depending on the extractor, so match both phrasings.
+  if (
+    lower.includes("cookies are no longer valid") ||
+    lower.includes("cookies have been rotated") ||
+    lower.includes("failed to decrypt") ||
+    lower.includes("dpapi") ||
+    (lower.includes("cookie") &&
+      (lower.includes("expired") || lower.includes("invalid") || lower.includes("no longer")))
+  ) {
+    return {
+      status: 502,
+      code: "COOKIES_INVALID",
+      message:
+        "The configured cookies were rejected or have expired. Re-export the browser cookies and update YTDLP_COOKIES_B64 (see DEPLOY.md).",
+    };
+  }
+
+  // yt-dlp's JS/PO-token challenges need Deno (or another supported JS
+  // runtime) and a recent yt-dlp. Without them YouTube returns only images or
+  // signature errors instead of playable formats.
+  if (
+    lower.includes("po token") ||
+    lower.includes("po_token") ||
+    lower.includes("only images are available") ||
+    lower.includes("js challenge") ||
+    lower.includes("yt-dlp-ejs") ||
+    lower.includes("signature extraction failed")
+  ) {
+    return {
+      status: 502,
+      code: "YOUTUBE_JS_CHALLENGE",
+      message:
+        "YouTube's JavaScript challenge could not be solved. Ensure Deno is installed on the server and yt-dlp is version 2026.10.21 or newer, then try again.",
+    };
+  }
+
   // Datacenter-IP bot check ("Sign in to confirm you're not a bot"). The info
   // fetcher retries alternate player clients before this surfaces; a signed-in
   // cookie file is the reliable fix.
   if (lower.includes("not a bot")) {
     return {
       status: 502,
+      code: "BOT_CHECK",
       message:
         "The source platform is asking this server to verify it isn't a bot. Add cookies to the backend (YTDLP_COOKIES_B64, see DEPLOY.md) or try another link.",
     };
@@ -197,22 +302,22 @@ export function classifyYtDlpError(stderr, code) {
     lower.includes("inappropriate for some users") ||
     (lower.includes("sign in") && lower.includes("age"))
   ) {
-    return { status: 403, message: "This video is age-restricted and requires sign-in." };
+    return { status: 403, code: "AGE_RESTRICTED", message: "This video is age-restricted and requires sign-in." };
   }
   if (lower.includes("login required") || lower.includes("requires authentication")) {
-    return { status: 403, message: "This post is private or requires sign-in. Add cookies to the backend or try another public link." };
+    return { status: 403, code: "LOGIN_REQUIRED", message: "This post is private or requires sign-in. Add cookies to the backend or try another public link." };
   }
   if (lower.includes("members-only") || lower.includes("join this channel") || lower.includes("members only")) {
-    return { status: 403, message: "This video is members-only or requires purchase." };
+    return { status: 403, code: "MEMBERS_ONLY", message: "This video is members-only or requires purchase." };
   }
   if (lower.includes("copyright") || lower.includes("blocked")) {
-    return { status: 403, message: "This video is blocked due to copyright or regional restrictions." };
+    return { status: 403, code: "GEO_BLOCKED", message: "This video is blocked due to copyright or regional restrictions." };
   }
   if (lower.includes("live event") || lower.includes("live chat") || lower.includes("premiere will begin")) {
-    return { status: 400, message: "Live streams and premieres are not supported." };
+    return { status: 400, code: "LIVE_UNSUPPORTED", message: "Live streams and premieres are not supported." };
   }
   if (lower.includes("no video formats found")) {
-    return { status: 400, message: "No downloadable video was found in this link. Try a reel or video post." };
+    return { status: 400, code: "NO_VIDEO_FORMATS", message: "No downloadable video was found in this link. Try a reel or video post." };
   }
   if (
     lower.includes("requested format is not available") ||
@@ -220,7 +325,7 @@ export function classifyYtDlpError(stderr, code) {
     lower.includes("format not available") ||
     lower.includes("format not found")
   ) {
-    return { status: 400, message: "Requested quality is not available. Please choose another quality." };
+    return { status: 400, code: "FORMAT_UNAVAILABLE", message: "Requested quality is not available. Please choose another quality." };
   }
   if (
     lower.includes("rate-limit") ||
@@ -228,13 +333,17 @@ export function classifyYtDlpError(stderr, code) {
     lower.includes("too many requests") ||
     lower.includes("http error 429")
   ) {
-    return { status: 429, message: "The platform is rate-limiting this server. Wait a minute and try again." };
+    return { status: 429, code: "RATE_LIMITED", message: "The platform is rate-limiting this server. Wait a minute and try again." };
   }
   if (lower.includes("unsupported url")) {
-    return { status: 400, message: "Unsupported link. Paste a YouTube, X, or Instagram video URL." };
+    return { status: 400, code: "UNSUPPORTED_URL", message: "Unsupported link. Paste a YouTube, X, or Instagram video URL." };
   }
   if (lower.includes("unable to extract") || lower.includes("extraction failed")) {
-    return { status: 502, message: "Failed to extract video information. The platform may have changed its format or the post is restricted." };
+    return {
+      status: 502,
+      code: "EXTRACTION_FAILED",
+      message: "Failed to extract video information. The platform may have changed its format, the post is restricted, or yt-dlp needs an update.",
+    };
   }
   // HTTP 403 on media data: YouTube periodically rejects the media URLs it
   // handed out (bot checks / stale signatures / IP throttling). The download
@@ -243,6 +352,7 @@ export function classifyYtDlpError(stderr, code) {
   if (lower.includes("http error 403") || lower.includes("unable to download video data") || lower.includes("forbidden")) {
     return {
       status: 502,
+      code: "MEDIA_403",
       message:
         "The source platform blocked this download (HTTP 403) even after retrying several sources. Wait a minute and try again, and keep yt-dlp up to date.",
     };
@@ -250,18 +360,27 @@ export function classifyYtDlpError(stderr, code) {
   if (lower.includes("no audio stream")) {
     return {
       status: 502,
+      code: "NO_AUDIO",
       message:
         "Every source for this video came back without audio. Try another quality or wait a minute and retry.",
     };
   }
-  if (lower.includes("network") || lower.includes("timeout")) {
-    return { status: 502, message: "Network error while contacting the source platform. Please try again." };
-  }
-  if (code === "TIMEOUT") {
-    return { status: 504, message: "Request timed out while fetching video information. Please try again." };
+  if (lower.includes("network") || lower.includes("connection")) {
+    return { status: 502, code: "NETWORK", message: "Network error while contacting the source platform. Please try again." };
   }
 
-  return { status: 500, message: "Failed to retrieve video information. Please try again." };
+  // Any other yt-dlp error is an upstream/extraction failure. Reporting 502
+  // (instead of a generic 500) tells the client that retrying may help and
+  // keeps server-side bugs distinguishable in the logs.
+  if (text) {
+    return {
+      status: 502,
+      code: "UPSTREAM_FAILURE",
+      message: "The source platform rejected the request or returned an unexpected response. Try again in a minute; if it keeps happening, update yt-dlp on the server.",
+    };
+  }
+
+  return { status: 500, code: "UNKNOWN", message: "Failed to retrieve video information. Please try again." };
 }
 
 /**
@@ -278,16 +397,33 @@ function execYtDlp(args, timeoutMs, signal) {
 
     let stdout = "";
     let stderr = "";
-    let timedOut = false;
-    let aborted = false;
+    let settled = false;
+    let timer = null;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+
+    const makeError = (message, errorCode, status = null) => {
+      const err = new Error(message);
+      err.code = errorCode;
+      if (status) err.status = status;
+      err.stderr = stderr;
+      err.stdout = stdout;
+      return err;
+    };
 
     const onAbort = () => {
-      aborted = true;
       try { proc.kill("SIGKILL"); } catch {}
-      const err = new Error("Request cancelled");
-      err.code = "ABORTED";
-      err.status = 499;
-      reject(err);
+      settle(reject, makeError("Request cancelled", "ABORTED", 499));
     };
 
     if (signal) {
@@ -295,13 +431,9 @@ function execYtDlp(args, timeoutMs, signal) {
       signal.addEventListener("abort", onAbort, { once: true });
     }
 
-    const timeout = setTimeout(() => {
-      timedOut = true;
+    timer = setTimeout(() => {
       try { proc.kill("SIGKILL"); } catch {}
-      const err = new Error("yt-dlp timed out");
-      err.code = "TIMEOUT";
-      err.stderr = stderr;
-      reject(err);
+      settle(reject, makeError("yt-dlp timed out", "TIMEOUT"));
     }, timeoutMs);
 
     const MAX_BUFFER = 10 * 1024 * 1024; // 10MB for info json
@@ -309,9 +441,8 @@ function execYtDlp(args, timeoutMs, signal) {
     proc.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf-8");
       if (stdout.length > MAX_BUFFER) {
-        clearTimeout(timeout);
         try { proc.kill("SIGKILL"); } catch {}
-        reject(new Error("yt-dlp output too large"));
+        settle(reject, makeError("yt-dlp output too large", "OUTPUT_TOO_LARGE"));
       }
     });
 
@@ -320,27 +451,25 @@ function execYtDlp(args, timeoutMs, signal) {
     });
 
     proc.on("error", (err) => {
-      clearTimeout(timeout);
-      if (signal) signal.removeEventListener("abort", onAbort);
       if (err.code === "ENOENT") {
         err.message = "yt-dlp binary not found. Please ensure yt-dlp is installed and in PATH.";
         err.status = 500;
+        err.code = "YTDLP_MISSING";
       }
-      reject(err);
+      err.stderr = stderr;
+      settle(reject, err);
     });
 
     proc.on("close", (code) => {
-      clearTimeout(timeout);
-      if (signal) signal.removeEventListener("abort", onAbort);
-      if (timedOut || aborted) return;
+      if (settled) return;
       if (code === 0) {
-        resolve({ stdout, stderr });
+        settle(resolve, { stdout, stderr });
       } else {
         const err = new Error(stderr || `yt-dlp exited with code ${code}`);
         err.code = code;
         err.stderr = stderr;
         err.stdout = stdout;
-        reject(err);
+        settle(reject, err);
       }
     });
   });
@@ -858,22 +987,42 @@ export async function getVideoInfo(rawUrl, options = {}) {
   ];
 
   // YouTube's datacenter-IP bot checks need alternate player clients. X and
-  // Instagram have no equivalent player flag, so one fresh extraction is used.
+  // Instagram have no equivalent player flag, so they get one fresh retry for
+  // transient extraction failures.
+  //
+  // `tv_downgraded` / `tv` are intentionally absent: older yt-dlp releases
+  // asked them for signed-in playback and YouTube replied "The page needs to
+  // be reloaded." `tv_samsung` is the replacement used by current yt-dlp.
   let result = null;
   let lastError = null;
-  const playerClients = isYouTube ? [null, "web_safari", "web_embedded", "tv"] : [null];
+  let attempts = 0;
+  const playerClients = isYouTube
+    ? [null, "web_safari", "web_embedded", "tv_samsung"]
+    : [null, null];
+  const deadline = Date.now() + INFO_TOTAL_TIMEOUT_MS;
+
   for (const playerClient of playerClients) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+
+    attempts += 1;
     const args = [...baseArgs];
     if (playerClient) args.push("--extractor-args", `youtube:player_client=${playerClient}`);
     args.push(url);
+
     try {
-      result = await execYtDlp(args, INFO_TIMEOUT_MS, signal);
+      result = await execYtDlp(args, Math.min(INFO_TIMEOUT_MS, remaining), signal);
       break;
     } catch (e) {
       if (e.code === "ABORTED" || e.status === 499) throw e;
       if (e.status) throw e;
       lastError = e;
       if (isFatalDownloadError(e.stderr || e.message)) break;
+
+      const wait = deadline - Date.now();
+      if (wait > INFO_RETRY_DELAY_MS) {
+        await new Promise((resolve) => setTimeout(resolve, INFO_RETRY_DELAY_MS));
+      }
     }
   }
 
@@ -882,7 +1031,9 @@ export async function getVideoInfo(rawUrl, options = {}) {
     const classified = classifyYtDlpError(stderr, lastError?.code);
     const err = new Error(classified.message);
     err.status = classified.status;
+    err.code = classified.code;
     err.original = stderr;
+    err.attempts = attempts;
     throw err;
   }
 
@@ -1122,8 +1273,9 @@ export function buildVideoAttempts({ plan = null, height = null, formatId = null
   if (isYouTube) {
     // Last resorts: alternate player clients. web_safari exposes the full
     // muxed HLS ladder, web_embedded exposes the DASH ladder (video-only +
-    // audio, so its selector always pairs audio), tv/mweb expose small
-    // progressive formats.
+    // audio, so its selector always pairs audio), tv_samsung exposes small
+    // progressive formats. Do not use `tv`/`tv_downgraded`: they are the
+    // clients behind YouTube's "The page needs to be reloaded." error.
     add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]/best`, {
       extractorArgs: ["youtube:player_client=web_safari"],
       note: "Trying an alternate YouTube player…",
@@ -1135,7 +1287,7 @@ export function buildVideoAttempts({ plan = null, height = null, formatId = null
       delayMs: 800,
     });
     add(`best[height<=${h}][protocol*=m3u8]/best[height<=${h}]/best`, {
-      extractorArgs: ["youtube:player_client=tv"],
+      extractorArgs: ["youtube:player_client=tv_samsung"],
       note: "Trying an alternate YouTube player…",
       delayMs: 800,
     });
@@ -1174,7 +1326,7 @@ export function buildAudioAttempts({ sourceFormatId = null, platform = null } = 
     },
     {
       selector: "best[height<=144]/best[height<=240]/best",
-      extractorArgs: ["youtube:player_client=tv"],
+      extractorArgs: ["youtube:player_client=tv_samsung"],
       note: "Trying an alternate YouTube player…",
       delayMs: 600,
     },
@@ -1791,6 +1943,27 @@ function inspectBinary(bin, args) {
  */
 export function getRuntimeDiagnostics() {
   const usage = process.memoryUsage();
+  const cookies = getCookiesInfo();
+  const ytDlp = inspectBinary(YTDLP_BIN, ["--version"]);
+  const ytDlpVersion = ytDlp.stdout || null;
+  const ytDlpSupported = isYtDlpVersionSupported(ytDlpVersion);
+  const warnings = [];
+
+  if (ytDlpSupported === false) {
+    warnings.push(
+      `yt-dlp ${ytDlpVersion} is older than the required ${MIN_YTDLP_VERSION}. ` +
+        'YouTube may fail with "The page needs to be reloaded." Rebuild the image with the pinned version.'
+    );
+  }
+  if (cookies.error) warnings.push(`Cookies: ${cookies.error}`);
+  if (cookies.warning) warnings.push(`Cookies: ${cookies.warning}`);
+  if (cookies.configured && !cookies.hasYouTubeAuth) {
+    warnings.push(
+      "The cookie file has no signed-in YouTube cookies (SID/HSID/SSID/APISID/SAPISID/LOGIN_INFO). " +
+        "YouTube bot checks will still apply."
+    );
+  }
+
   return {
     platform: process.platform,
     arch: process.arch,
@@ -1808,10 +1981,16 @@ export function getRuntimeDiagnostics() {
     lowMemoryHost: LOW_MEMORY_HOST,
     sequentialMerge: SEQUENTIAL_MERGE,
     concurrentFragments: CONCURRENT_FRAGMENTS,
-    cookies: getCookiesInfo(),
-    ytDlp: inspectBinary(YTDLP_BIN, ["--version"]),
+    cookies,
+    ytDlp: {
+      ...ytDlp,
+      version: ytDlpVersion,
+      minimumVersion: MIN_YTDLP_VERSION,
+      supported: ytDlpSupported,
+    },
     ffmpeg: inspectBinary(process.env.FFMPEG_BIN || "ffmpeg", ["-version"]),
     deno: inspectBinary(process.env.DENO_BIN || "deno", ["--version"]),
+    warnings,
     recentErrors: getRecentErrors(),
   };
 }

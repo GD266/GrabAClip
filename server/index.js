@@ -14,6 +14,8 @@ import {
   getYtDlpVersion,
   getRuntimeDiagnostics,
   getCookiesInfo,
+  isYtDlpVersionSupported,
+  MIN_YTDLP_VERSION,
   LOW_MEMORY_HOST,
   SEQUENTIAL_MERGE,
   MEMORY_LIMIT_BYTES,
@@ -55,11 +57,24 @@ app.use((req, res, next) => {
 });
 
 // Health
-// ytDlpVersion is informational: keep yt-dlp up to date (see AGENTS.md),
-// stale versions get their YouTube media URLs rejected (HTTP 403).
+// ytDlpVersion and ytDlpSupported are the quickest way to confirm that a
+// deploy really picked up the pinned yt-dlp. Versions before 2026.10.21 fail
+// signed-in YouTube extraction with "The page needs to be reloaded."
 app.get("/api/health", async (req, res) => {
   const version = await getYtDlpVersion();
-  const payload = { status: "ok", ytDlp: process.env.YTDLP_BIN || "yt-dlp", ytDlpVersion: version };
+  const supported = isYtDlpVersionSupported(version);
+  const payload = {
+    status: "ok",
+    ytDlp: process.env.YTDLP_BIN || "yt-dlp",
+    ytDlpVersion: version,
+    ytDlpMinimumVersion: MIN_YTDLP_VERSION,
+    ytDlpSupported: supported,
+  };
+  if (supported === false) {
+    payload.warning =
+      `yt-dlp ${version} is older than ${MIN_YTDLP_VERSION}; YouTube extraction may fail with ` +
+      '"The page needs to be reloaded." Rebuild with the pinned image.';
+  }
   // `?diagnostics=1` reports whether the container can run its native tools.
   if (req.query.diagnostics === "1") payload.diagnostics = getRuntimeDiagnostics();
   res.json(payload);
@@ -118,9 +133,33 @@ app.listen(PORT, async () => {
   );
   const version = await getYtDlpVersion();
   console.log(`yt-dlp binary: ${process.env.YTDLP_BIN || "yt-dlp"}${version ? ` (version ${version})` : " (version unknown)"}`);
-  const cookies = getCookiesInfo();
-  console.log(`yt-dlp cookies: ${cookies.configured ? `configured (${cookies.source})` : "not configured"}`);
+  const supported = isYtDlpVersionSupported(version);
   if (!version) {
     console.warn("[startup] yt-dlp is not runnable. Check YTDLP_BIN and the container image; see /api/health?diagnostics=1.");
+  } else if (supported === false) {
+    console.warn(
+      `[startup] yt-dlp ${version} is older than ${MIN_YTDLP_VERSION}. ` +
+        'YouTube may fail with "The page needs to be reloaded." Rebuild with the pinned Docker image.'
+    );
+  }
+
+  const cookies = getCookiesInfo();
+  if (!cookies.configured) {
+    console.log("yt-dlp cookies: not configured");
+    if (cookies.error) console.warn(`[startup] cookies: ${cookies.error}`);
+    else if (cookies.warning) console.warn(`[startup] cookies: ${cookies.warning}`);
+  } else {
+    console.log(
+      `yt-dlp cookies: configured (${cookies.source}, ${cookies.count} cookies, ` +
+        `YouTube auth: ${cookies.hasYouTubeAuth ? "yes" : "no"}, domains: ${(cookies.domains || []).join(", ") || "unknown"})`
+    );
+    if (cookies.error) console.warn(`[startup] cookies: ${cookies.error}`);
+    if (cookies.warning) console.warn(`[startup] cookies: ${cookies.warning}`);
+    if (!cookies.hasYouTubeAuth) {
+      console.warn(
+        "[startup] cookies contain no signed-in YouTube cookies; YouTube bot checks will still apply. " +
+          "Re-export youtube.com while signed in."
+      );
+    }
   }
 });
