@@ -9,6 +9,7 @@ import { PassThrough } from "node:stream";
 import {
   buildVideoFormats,
   buildGenericVideoFormats,
+  buildFacebookVideoFormats,
   buildAudioFormats,
   pickAudioSource,
   classifyYtDlpError,
@@ -190,6 +191,61 @@ const igAudio131 = {
   abr: 131.525,
 };
 
+// Facebook: DASH video renditions carry real dimensions, while Reels are often
+// silent. Older posts only expose the legacy dimension-less sd/hd MP4s.
+const fbDashVideo720 = {
+  format_id: "dash-998877665544v",
+  ext: "mp4",
+  protocol: "https",
+  vcodec: "avc1.4d401f",
+  acodec: "none",
+  width: 720,
+  height: 1280,
+  tbr: 1500.5,
+  fps: 30,
+};
+
+const fbDashVideo480 = {
+  format_id: "dash-112233445566v",
+  ext: "mp4",
+  protocol: "https",
+  vcodec: "avc1.4d401e",
+  acodec: "none",
+  width: 480,
+  height: 852,
+  tbr: 750,
+  fps: 30,
+};
+
+const fbDashAudio128 = {
+  format_id: "dash-778899001122a",
+  ext: "m4a",
+  protocol: "https",
+  vcodec: "none",
+  acodec: "mp4a.40.2",
+  abr: 128,
+};
+
+const fbLegacySd = {
+  format_id: "sd",
+  ext: "mp4",
+  protocol: "https",
+  vcodec: "none",
+  acodec: "none",
+  audio_ext: "none",
+  tbr: 500,
+};
+
+const fbLegacyHd = {
+  format_id: "hd",
+  ext: "mp4",
+  protocol: "https",
+  vcodec: "none",
+  acodec: "none",
+  audio_ext: "none",
+  tbr: 1200,
+};
+
 // ---------------------------------------------------------------------------
 // buildVideoFormats
 // ---------------------------------------------------------------------------
@@ -352,6 +408,88 @@ test("buildGenericVideoFormats keeps silent posts downloadable without audio", (
 });
 
 // ---------------------------------------------------------------------------
+// Facebook format planning
+// ---------------------------------------------------------------------------
+
+test("buildFacebookVideoFormats uses the short side for portrait DASH videos", () => {
+  const plans = buildFacebookVideoFormats([fbDashVideo720, fbDashVideo480, fbDashAudio128], 60);
+  assert.deepEqual(
+    plans.map((plan) => plan.height),
+    [720, 480]
+  );
+
+  const top = plans[0];
+  assert.equal(top.label, "720p");
+  assert.equal(top.kind, "merge");
+  assert.equal(top.hasAudio, true);
+  assert.deepEqual(top.formatIds, ["dash-998877665544v", "dash-778899001122a"]);
+  assert.deepEqual(top.selectors, [
+    "dash-998877665544v+dash-778899001122a",
+    "dash-998877665544v+bestaudio/best",
+    "bestvideo*+bestaudio/best",
+  ]);
+});
+
+test("buildFacebookVideoFormats keeps a silent Reel downloadable", () => {
+  const [plan] = buildFacebookVideoFormats([fbDashVideo720]);
+  assert.equal(plan.height, 720);
+  assert.equal(plan.kind, "video");
+  assert.equal(plan.hasAudio, false);
+  assert.deepEqual(plan.selectors, ["dash-998877665544v", "best"]);
+});
+
+test("buildFacebookVideoFormats falls back to legacy sd/hd files without dimensions", () => {
+  const [plan] = buildFacebookVideoFormats([fbLegacySd, fbLegacyHd], 60);
+  assert.equal(plan.height, 720);
+  assert.equal(plan.label, "Source quality");
+  assert.equal(plan.displayLabel, "Source quality");
+  assert.equal(plan.kind, "muxed");
+  assert.equal(plan.source, "progressive");
+  assert.equal(plan.hasAudio, true);
+  assert.equal(plan.formatId, "hd");
+  assert.deepEqual(plan.formatIds, ["hd"]);
+  assert.deepEqual(plan.selectors, ["hd", "sd", "best"]);
+  assert.equal(plan.estimatedSize, 9000000); // 1200 kbps * 60 s / 8
+});
+
+test("buildFacebookVideoFormats handles sd-only legacy posts and ignores non-MP4 files", () => {
+  const [sd] = buildFacebookVideoFormats([fbLegacySd]);
+  assert.equal(sd.formatId, "sd");
+  assert.deepEqual(sd.selectors, ["sd", "best"]);
+
+  const [silent] = buildFacebookVideoFormats([fbLegacySd, fbLegacyHd], null, { hasAudio: false });
+  assert.equal(silent.hasAudio, false);
+  assert.equal(silent.acodec, null);
+
+  assert.deepEqual(buildFacebookVideoFormats([{ ...fbLegacyHd, ext: "webm" }]), []);
+  assert.deepEqual(buildFacebookVideoFormats([]), []);
+  assert.deepEqual(buildFacebookVideoFormats(null), []);
+});
+
+test("buildFacebookVideoFormats prefers dimensioned DASH plans over legacy files", () => {
+  const plans = buildFacebookVideoFormats([fbLegacySd, fbLegacyHd, fbDashVideo720, fbDashAudio128]);
+  assert.equal(plans.length, 1);
+  assert.equal(plans[0].kind, "merge");
+  assert.deepEqual(plans[0].formatIds, ["dash-998877665544v", "dash-778899001122a"]);
+});
+
+test("Facebook video and audio attempts stay free of YouTube player flags", () => {
+  const [plan] = buildFacebookVideoFormats([fbDashVideo720, fbDashAudio128]);
+  const attempts = buildVideoAttempts({ plan, height: 720, platform: "facebook" });
+  assert.equal(attempts[0].selector, "dash-998877665544v+dash-778899001122a");
+  assert.ok(attempts.every((attempt) => !attempt.extractorArgs));
+  assert.ok(attempts.length <= 9);
+
+  const audioAttempts = buildAudioAttempts({
+    sourceFormatId: "dash-778899001122a",
+    platform: "facebook",
+  });
+  assert.equal(audioAttempts[0].selector, "dash-778899001122a/bestaudio/best");
+  assert.ok(audioAttempts.every((attempt) => !attempt.extractorArgs));
+  assert.ok(audioAttempts.some((attempt) => attempt.selector === "best"));
+});
+
+// ---------------------------------------------------------------------------
 // Audio options / source selection
 // ---------------------------------------------------------------------------
 
@@ -406,6 +544,24 @@ test("pickAudioSource falls back to a muxed rendition when no audio-only format 
   assert.match(source.label, /Muxed audio \(360p\)/);
 });
 
+test("pickAudioSource falls back to legacy Facebook hd/sd muxed files", () => {
+  const source = pickAudioSource([fbLegacySd, fbLegacyHd]);
+  assert.equal(source.formatId, "hd");
+  assert.equal(source.height, null);
+  assert.equal(source.ext, "mp4");
+  assert.equal(source.acodec, "aac");
+  assert.equal(source.label, "Facebook source audio");
+
+  assert.equal(pickAudioSource([fbLegacySd]).formatId, "sd");
+
+  // A silent Reel has no audio-only format but does expose dimensioned
+  // video-only renditions next to its legacy files; do not advertise audio.
+  assert.equal(pickAudioSource([fbLegacySd, fbLegacyHd, fbDashVideo720]), null);
+
+  // An explicit opt-out also disables the legacy fallback.
+  assert.equal(pickAudioSource([fbLegacySd, fbLegacyHd], { allowLegacy: false }), null);
+});
+
 // ---------------------------------------------------------------------------
 // classifyYtDlpError
 // ---------------------------------------------------------------------------
@@ -420,6 +576,27 @@ test("classifyYtDlpError maps unavailable/private/age-restricted videos", () => 
   assert.equal(classifyYtDlpError("ERROR: Video unavailable", 1).status, 404);
   assert.equal(classifyYtDlpError("ERROR: Private video. Sign in to view", 1).status, 403);
   assert.equal(classifyYtDlpError("ERROR: Sign in to confirm your age", 1).status, 403);
+});
+
+test("classifyYtDlpError explains Facebook login gates and image-only posts", () => {
+  const login = classifyYtDlpError("ERROR: [facebook] 123: Login required", 1);
+  assert.equal(login.status, 403);
+  assert.equal(login.code, "LOGIN_REQUIRED");
+
+  const noVideo = classifyYtDlpError("ERROR: [facebook] 123: No video formats found!", 1);
+  assert.equal(noVideo.status, 400);
+  assert.equal(noVideo.code, "NO_VIDEO_FORMATS");
+  assert.match(noVideo.message, /Images tab/);
+
+  assert.equal(
+    isFatalDownloadError("ERROR: [facebook] 123: This content isn't available right now"),
+    true
+  );
+  assert.equal(
+    isFatalDownloadError("ERROR: [facebook] 123: HTTP Error 403: Forbidden"),
+    false,
+    "a blocked media URL is retryable"
+  );
 });
 
 test("classifyYtDlpError maps the datacenter-IP bot check to 502", () => {

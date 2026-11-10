@@ -56,9 +56,41 @@ test("the frontend sends API calls through the configurable base", () => {
   assert.match(app, /apiUrl\(`\/api\/download\/audio\?/);
   assert.match(app, /fetch\(apiUrl\("\/api\/downloads\/status"\)\)/);
   assert.match(app, /fetch\(apiUrl\("\/api\/intelligence"\)/);
+  assert.match(app, /apiUrl\(`\/api\/image\?/);
+  assert.match(app, /apiUrl\(`\/api\/download\/image\?/);
+  assert.match(app, /apiUrl\(`\/api\/download\/images\?/);
 
   // No bare API fetches should remain (they would ignore API_BASE).
   assert.doesNotMatch(app, /fetch\("\/api\//);
+});
+
+test("index.html exposes the Facebook Images tab and gallery controls", () => {
+  const html = read("public/index.html");
+  assert.match(html, /id="tabImages"/);
+  assert.match(html, /id="panelImages"/);
+  assert.match(html, /id="imageGallery"/);
+  assert.match(html, /id="imageBadge"/);
+  assert.match(html, /id="downloadAllImagesBtn"/);
+  assert.match(html, /id="cancelImagesBtn"/);
+  assert.match(html, /id="imageProgress"/);
+  assert.match(html, /id="imageStatus"/);
+  assert.match(html, /Facebook/);
+});
+
+test("the backend mounts the Facebook image preview and download endpoints", () => {
+  const index = read("server/index.js");
+  assert.match(index, /createImageRouter/);
+  assert.match(index, /createImagesZipRouter/);
+  assert.match(index, /app\.use\("\/api\/image", createImageRouter\(\{ download: false \}\)\)/);
+  assert.match(index, /app\.use\("\/api\/download\/image", createImageRouter\(\{ download: true \}\)\)/);
+  assert.match(index, /app\.use\("\/api\/download\/images", createImagesZipRouter\(\)\)/);
+
+  const images = read("server/routes/image.js");
+  assert.match(images, /normalizeMediaUrl/);
+  assert.match(images, /detectPlatform/);
+  assert.match(images, /fetchFacebookImage/);
+  assert.match(images, /createZipBuffer/);
+  assert.match(images, /Content-Disposition/);
 });
 
 test("vercel.json deploys the public directory", () => {

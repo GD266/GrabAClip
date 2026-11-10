@@ -8,6 +8,10 @@ import {
   isSupportedMediaUrl,
   normalizeMediaUrl,
   extractMediaId,
+  isFacebookUrl,
+  getFacebookKind,
+  normalizeFacebookUrl,
+  extractFacebookId,
 } from "../../public/shared/validator.js";
 
 export {
@@ -18,6 +22,10 @@ export {
   isSupportedMediaUrl,
   normalizeMediaUrl,
   extractMediaId,
+  isFacebookUrl,
+  getFacebookKind,
+  normalizeFacebookUrl,
+  extractFacebookId,
 };
 
 /**
@@ -83,7 +91,7 @@ export function sanitizeAsciiFilename(name) {
 }
 
 const SUPPORTED_LINKS =
-  "Paste a YouTube, X, or Instagram video link (for example youtube.com/watch?v=…, x.com/user/status/…, or instagram.com/reel/…).";
+  "Paste a YouTube, X, Instagram, or Facebook link (for example youtube.com/watch?v=…, x.com/user/status/…, instagram.com/reel/…, or facebook.com/watch/?v=…). Public Facebook photo and image-post links are supported too.";
 
 /**
  * Validate info request for any supported platform.

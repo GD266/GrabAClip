@@ -224,12 +224,17 @@ the exported file with `--cookies`.
   exit code and stderr for yt-dlp, ffmpeg and deno, the container memory limit,
   `lowMemoryHost`/`sequentialMerge`, cookie metadata, `warnings`,
   `uptimeSeconds` and `recentErrors`.
-- **`POST /api/info` now fails within ~45 seconds instead of hanging.** Each
-  player/extraction attempt is capped at 20 seconds and the whole lookup at 45
-  seconds; a timeout returns **504** with `code: "TIMEOUT"`. Other API errors
-  include a `code` field (for example `YOUTUBE_PAGE_RELOAD`, `COOKIES_INVALID`,
-  `BOT_CHECK`, `MEDIA_403`), which makes the cause visible without reading
-  server logs.
+- **`POST /api/info` fails within ~60 seconds instead of hanging.** Each
+  player/extraction attempt is capped at 60 seconds and the whole lookup at 60
+  seconds; a timeout returns **504** with `code: "TIMEOUT"`. The budget is this
+  high because signed-in YouTube extraction runs a Deno JavaScript challenge
+  that takes 5–12 s on a normal machine and much longer on a 0.1-CPU Render
+  instance. Per-attempt durations are logged as
+  `[info] youtube extraction failed via <client> after <n>ms`, so the service
+  log shows whether the challenge or the network is the bottleneck. Other API
+  errors include a `code` field (for example `YOUTUBE_PAGE_RELOAD`,
+  `COOKIES_INVALID`, `BOT_CHECK`, `MEDIA_403`), which makes the cause visible
+  without reading server logs.
 - A download that dies with a bare 502 from the host (no CORS headers, status
   polling suddenly returns invalid JSON) usually means the container was
   killed. On a 512 MB instance the likely cause is memory: the image

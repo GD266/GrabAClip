@@ -64,8 +64,18 @@ const vQualityCountEl = $("vQualityCount");
 const vDescriptionEl = $("vDescription");
 
 // Tabs
-const tabs = { video: $("tabVideo"), audio: $("tabAudio"), intel: $("tabIntel") };
-const panels = { video: $("panelVideo"), audio: $("panelAudio"), intel: $("panelIntel") };
+const tabs = {
+  video: $("tabVideo"),
+  audio: $("tabAudio"),
+  images: $("tabImages"),
+  intel: $("tabIntel"),
+};
+const panels = {
+  video: $("panelVideo"),
+  audio: $("panelAudio"),
+  images: $("panelImages"),
+  intel: $("panelIntel"),
+};
 
 // Video panel
 const qualityGridEl = $("qualityGrid");
@@ -85,6 +95,15 @@ const cancelAudioBtn = $("cancelAudioBtn");
 const audioProgressEl = $("audioProgress");
 const audioStatusEl = $("audioStatus");
 
+// Images panel
+const imageGalleryEl = $("imageGallery");
+const imageBadgeEl = $("imageBadge");
+const imageSourceNoteEl = $("imageSourceNote");
+const downloadAllImagesBtn = $("downloadAllImagesBtn");
+const cancelImagesBtn = $("cancelImagesBtn");
+const imageProgressEl = $("imageProgress");
+const imageStatusEl = $("imageStatus");
+
 // Intelligence panel
 const getIntelligenceBtn = $("getIntelligenceBtn");
 const intelligenceStatusEl = $("intelligenceStatus");
@@ -101,17 +120,20 @@ const aiErrorEl = $("aiError");
 let currentUrl = "";
 let currentInfo = null;
 let currentPlatform = null;
+let currentMediaType = "video";
 let selectedHeight = null;
 let selectedAudio = null;
 const downloads = {
   video: { active: false, controller: null, poll: null },
   audio: { active: false, controller: null, poll: null },
+  image: { active: false, controller: null, poll: null },
 };
 
 const PLATFORM_NAMES = {
   youtube: "YouTube",
   x: "X",
   instagram: "Instagram",
+  facebook: "Facebook",
 };
 
 const PHASE_LABELS = {
@@ -206,6 +228,24 @@ function setIntelligenceAvailability(platform) {
   if (!available && tabs.intel.classList.contains("is-active")) activateTab("video");
 }
 
+function setMediaAvailability(platform, mediaType) {
+  const isVideo = mediaType === "video";
+  tabs.video.classList.toggle("hidden", !isVideo);
+  tabs.audio.classList.toggle("hidden", !isVideo);
+  tabs.images.classList.toggle("hidden", isVideo);
+  setIntelligenceAvailability(platform);
+
+  if (!isVideo && (tabs.video.classList.contains("is-active") || tabs.audio.classList.contains("is-active"))) {
+    activateTab("images");
+  } else if (isVideo && tabs.images.classList.contains("is-active")) {
+    activateTab("video");
+  }
+}
+
+function isImageMedia() {
+  return currentMediaType === "image" || currentMediaType === "gallery";
+}
+
 // ---------------------------------------------------------------------------
 // Info
 // ---------------------------------------------------------------------------
@@ -214,11 +254,15 @@ async function getVideo() {
   const url = urlInput.value.trim();
 
   if (!url) {
-    setStatus(statusEl, "Please paste a YouTube, X, or Instagram link.", "error");
+    setStatus(statusEl, "Please paste a YouTube, X, Instagram, or Facebook link.", "error");
     return;
   }
   if (!isSupportedMediaUrl(url)) {
-    setStatus(statusEl, "Unsupported link. Use a YouTube video, X post, or Instagram reel/post URL.", "error");
+    setStatus(
+      statusEl,
+      "Unsupported link. Use a YouTube video, X post, Instagram reel/post, or public Facebook video/photo URL.",
+      "error"
+    );
     return;
   }
 
@@ -249,12 +293,17 @@ async function getVideo() {
     currentUrl = normalizedUrl;
     currentInfo = data;
     currentPlatform = data.platform || requestedPlatform || null;
+    currentMediaType = data.mediaType || "video";
+    const imageMedia = isImageMedia();
+    const images = Array.isArray(data.images) ? data.images : [];
+    const imageCount = data.imageCount || images.length;
 
     vTitleEl.textContent = data.title || "Untitled";
     vChannelEl.textContent = data.channel || "Unknown";
-    vDurationEl.textContent =
-      data.durationFormatted ||
-      (data.duration ? `${Math.floor(data.duration / 60)}:${String(data.duration % 60).padStart(2, "0")}` : "Unknown");
+    vDurationEl.textContent = imageMedia
+      ? `${imageCount} ${imageCount === 1 ? "image" : "images"}`
+      : data.durationFormatted ||
+        (data.duration ? `${Math.floor(data.duration / 60)}:${String(data.duration % 60).padStart(2, "0")}` : "Unknown");
     const platformName = PLATFORM_NAMES[currentPlatform] || "";
     vIdKickerEl.textContent = data.videoId
       ? `${platformName ? `${platformName} · ` : ""}ID ${data.videoId}`
@@ -262,13 +311,24 @@ async function getVideo() {
     vUploadDateEl.textContent = data.uploadDateFormatted || data.uploadDate || "Unknown";
     vViewsEl.textContent = data.viewCount != null ? Number(data.viewCount).toLocaleString() : "Unknown";
     vLikesEl.textContent = data.likeCount != null ? Number(data.likeCount).toLocaleString() : "Unknown";
-    vQualityCountEl.textContent = (data.formats || []).length
-      ? `${(data.formats || []).length} video · ${(data.audioFormats || []).length} audio`
-      : "—";
-    vDescriptionEl.textContent = data.description || "No description";
+    vQualityCountEl.textContent = imageMedia
+      ? `${imageCount} ${imageCount === 1 ? "image" : "images"}`
+      : (data.formats || []).length
+        ? `${(data.formats || []).length} video · ${(data.audioFormats || []).length} audio`
+        : "—";
+    vDescriptionEl.textContent = data.description || (imageMedia ? "Public Facebook image post" : "No description");
 
     if (data.thumbnail) {
       thumbEl.src = data.thumbnail;
+      thumbEl.style.display = "block";
+      thumbFallbackEl.classList.add("hidden");
+      thumbEl.onload = () => thumbFallbackEl.classList.add("hidden");
+      thumbEl.onerror = () => {
+        thumbEl.style.display = "none";
+        thumbFallbackEl.classList.remove("hidden");
+      };
+    } else if (imageMedia && images.length > 0) {
+      thumbEl.src = imageProxyUrl(0);
       thumbEl.style.display = "block";
       thumbFallbackEl.classList.add("hidden");
       thumbEl.onload = () => thumbFallbackEl.classList.add("hidden");
@@ -283,17 +343,20 @@ async function getVideo() {
     }
 
     // The H.264 compatibility choice only exists for YouTube's plan sets.
-    if (sizeToggleRowEl) sizeToggleRowEl.classList.toggle("hidden", currentPlatform !== "youtube");
-    setIntelligenceAvailability(currentPlatform);
+    if (sizeToggleRowEl) sizeToggleRowEl.classList.toggle("hidden", currentPlatform !== "youtube" || imageMedia);
+    setMediaAvailability(currentPlatform, currentMediaType);
 
-    renderVideoOptions(videoFormatsForUi());
-    renderAudioOptions(data.audioFormats || [], data.audioSource || null);
+    renderVideoOptions(imageMedia ? [] : videoFormatsForUi());
+    renderAudioOptions(imageMedia ? [] : data.audioFormats || [], imageMedia ? null : data.audioSource || null);
+    renderImages(images);
 
-    // Reset download UI for the new video
+    // Reset download UI for the new media item.
     resetProgress(videoProgressEl);
     resetProgress(audioProgressEl);
+    resetProgress(imageProgressEl);
     setStatus(downloadStatusEl, "", "");
     setStatus(audioStatusEl, "", "");
+    setStatus(imageStatusEl, "", "");
     setStatus(intelligenceStatusEl, "", "");
     intelligenceContentEl.classList.add("hidden");
     transcriptTextEl.textContent = "";
@@ -304,8 +367,14 @@ async function getVideo() {
     setStatus(aiErrorEl, "", "");
 
     resultArea.classList.remove("hidden");
-    activateTab("video");
-    setStatus(statusEl, "Media ready. Pick a quality and download.", "success");
+    activateTab(imageMedia ? "images" : "video");
+    setStatus(
+      statusEl,
+      imageMedia
+        ? "Images ready. Download one or the whole gallery."
+        : "Media ready. Pick a quality and download.",
+      "success"
+    );
   } catch (err) {
     setStatus(statusEl, errorMessage(err, "An error occurred."), "error");
     resultArea.classList.add("hidden");
@@ -313,7 +382,7 @@ async function getVideo() {
     getVideoBtn.disabled = false;
     const label2 = getVideoBtn.querySelector(".btn-label");
     const spinner2 = getVideoBtn.querySelector(".btn-spinner");
-    if (label2) label2.textContent = "Get video";
+    if (label2) label2.textContent = "Get media";
     if (spinner2) spinner2.classList.add("hidden");
     if (inputShellEl) inputShellEl.style.opacity = "";
   }
@@ -326,7 +395,7 @@ async function getVideo() {
 function sourceLabel(plan) {
   if (!plan) return "";
   if (plan.hasAudio === false || plan.kind === "video") return "Video only";
-  if (plan.kind === "muxed") return "HLS stream";
+  if (plan.kind === "muxed") return plan.source === "progressive" ? "Single file" : "HLS stream";
   if (plan.kind === "merge") return "Video + audio merge";
   return "Single file";
 }
@@ -465,12 +534,186 @@ function selectAudioOption(option, audioSource = null) {
 }
 
 // ---------------------------------------------------------------------------
+// Image gallery
+// ---------------------------------------------------------------------------
+
+function imageProxyUrl(index) {
+  const params = new URLSearchParams({ url: currentUrl, index: String(index) });
+  return apiUrl(`/api/image?${params.toString()}`);
+}
+
+function imageDownloadUrl(index) {
+  const params = new URLSearchParams({ url: currentUrl, index: String(index) });
+  return apiUrl(`/api/download/image?${params.toString()}`);
+}
+
+function renderImages(images) {
+  if (!imageGalleryEl) return;
+  imageGalleryEl.innerHTML = "";
+  const count = Array.isArray(images) ? images.length : 0;
+  if (imageBadgeEl) imageBadgeEl.textContent = `${count} ${count === 1 ? "image" : "images"}`;
+
+  if (count === 0) {
+    if (downloadAllImagesBtn) downloadAllImagesBtn.disabled = true;
+    if (imageSourceNoteEl) imageSourceNoteEl.textContent = "";
+    return;
+  }
+
+  if (downloadAllImagesBtn) downloadAllImagesBtn.disabled = false;
+  if (imageSourceNoteEl) {
+    imageSourceNoteEl.textContent =
+      count === 1
+        ? "Public Facebook image. Download it below."
+        : `Public Facebook gallery · ${count} images. Download individually or save all as a ZIP.`;
+  }
+
+  images.forEach((image, index) => {
+    const card = document.createElement("div");
+    card.className = "image-card";
+    card.setAttribute("role", "listitem");
+
+    const link = document.createElement("a");
+    link.className = "image-thumb-link";
+    link.href = imageProxyUrl(index);
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = `Open image ${index + 1}`;
+
+    const img = document.createElement("img");
+    img.className = "image-thumb";
+    img.src = imageProxyUrl(index);
+    img.alt = `Facebook image ${index + 1}`;
+    img.loading = "lazy";
+    img.decoding = "async";
+    if (image.width && image.height) {
+      img.width = image.width;
+      img.height = image.height;
+    }
+    link.appendChild(img);
+
+    const footer = document.createElement("div");
+    footer.className = "image-card-footer";
+
+    const meta = document.createElement("span");
+    meta.className = "image-card-meta";
+    const dimensions = image.width && image.height ? `${image.width}×${image.height}` : "Facebook image";
+    meta.textContent = `Image ${index + 1} · ${dimensions}`;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-secondary btn-sm";
+    btn.textContent = "Download";
+    btn.addEventListener("click", () => downloadImage(index, btn));
+
+    footer.append(meta, btn);
+    card.append(link, footer);
+    imageGalleryEl.appendChild(card);
+  });
+}
+
+function setImageDownloading(isDownloading) {
+  downloads.image.active = isDownloading;
+  if (downloadAllImagesBtn) downloadAllImagesBtn.disabled = isDownloading;
+  if (cancelImagesBtn) cancelImagesBtn.classList.toggle("hidden", !isDownloading);
+  for (const btn of imageGalleryEl.querySelectorAll("button")) btn.disabled = isDownloading;
+  if (downloadAllImagesBtn) {
+    downloadAllImagesBtn.textContent = isDownloading ? "Preparing download…" : "Download all as ZIP";
+  }
+}
+
+function cancelImageDownload() {
+  const state = downloads.image;
+  if (state.controller) {
+    state.controller.abort();
+    state.controller = null;
+  }
+  setImageDownloading(false);
+  resetProgress(imageProgressEl);
+  setStatus(imageStatusEl, "Image download cancelled.", "error");
+}
+
+function downloadImage(index, button = null) {
+  if (!currentUrl || downloads.image.active) return;
+  const label = button?.textContent;
+  if (button) button.textContent = "Downloading…";
+  setImageDownloading(true);
+  resetProgress(imageProgressEl);
+  showIndeterminateProgress(imageProgressEl);
+  setStatus(imageStatusEl, "Downloading image…", "loading");
+
+  downloadWithProgress(
+    imageDownloadUrl(index),
+    { statusEl: imageStatusEl, progressEl: imageProgressEl },
+    (received, total) => {
+      if (total) {
+        const pct = Math.round((received / total) * 100);
+        setStatus(imageStatusEl, `Downloading image… ${formatBytesProgress(received)} / ${formatBytesProgress(total)} (${pct}%)`, "loading");
+      } else {
+        setStatus(imageStatusEl, `Downloading image… ${formatBytesProgress(received)}`, "loading");
+      }
+    },
+    "image"
+  )
+    .then(({ blob, filename }) => {
+      if (blob.size === 0) throw new Error("Downloaded image is empty.");
+      saveBlob(blob, filename || `facebook-image-${index + 1}.jpg`);
+      setStatus(imageStatusEl, `Complete: ${filename || `image ${index + 1}`} (${formatBytesProgress(blob.size)})`, "success");
+    })
+    .catch((err) => {
+      if (err.name === "AbortError") setStatus(imageStatusEl, "Image download cancelled.", "error");
+      else setStatus(imageStatusEl, errorMessage(err, "Image download failed."), "error");
+    })
+    .finally(() => {
+      resetProgress(imageProgressEl);
+      setImageDownloading(false);
+      if (button) button.textContent = label || "Download";
+    });
+}
+
+function downloadAllImages() {
+  if (!currentUrl || downloads.image.active) return;
+  setImageDownloading(true);
+  resetProgress(imageProgressEl);
+  showIndeterminateProgress(imageProgressEl);
+  setStatus(imageStatusEl, "Packaging image gallery…", "loading");
+
+  const params = new URLSearchParams({ url: currentUrl });
+  downloadWithProgress(
+    apiUrl(`/api/download/images?${params.toString()}`),
+    { statusEl: imageStatusEl, progressEl: imageProgressEl },
+    (received, total) => {
+      if (total) {
+        const pct = Math.round((received / total) * 100);
+        setStatus(imageStatusEl, `Downloading ZIP… ${formatBytesProgress(received)} / ${formatBytesProgress(total)} (${pct}%)`, "loading");
+      } else {
+        setStatus(imageStatusEl, `Downloading ZIP… ${formatBytesProgress(received)}`, "loading");
+      }
+    },
+    "image"
+  )
+    .then(({ blob, filename }) => {
+      if (blob.size === 0) throw new Error("Downloaded ZIP is empty.");
+      saveBlob(blob, filename || "facebook-images.zip");
+      setStatus(imageStatusEl, `Complete: ${filename || "facebook-images.zip"} (${formatBytesProgress(blob.size)})`, "success");
+    })
+    .catch((err) => {
+      if (err.name === "AbortError") setStatus(imageStatusEl, "Image download cancelled.", "error");
+      else setStatus(imageStatusEl, errorMessage(err, "Image gallery download failed."), "error");
+    })
+    .finally(() => {
+      resetProgress(imageProgressEl);
+      setImageDownloading(false);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Downloads
 // ---------------------------------------------------------------------------
 
-function downloadWithProgress(url, { statusEl: statusTarget, progressEl }, onProgress) {
+function downloadWithProgress(url, { statusEl: statusTarget, progressEl }, onProgress, stateKey = null) {
   const controller = new AbortController();
-  const state = url.includes("/audio") ? downloads.audio : downloads.video;
+  const key = stateKey || (url.includes("/audio") ? "audio" : "video");
+  const state = downloads[key];
   state.controller = controller;
 
   return fetch(url, { signal: controller.signal }).then(async (response) => {
@@ -854,6 +1097,7 @@ urlInput.addEventListener("input", () => {
 
 tabs.video.addEventListener("click", () => activateTab("video"));
 tabs.audio.addEventListener("click", () => activateTab("audio"));
+tabs.images.addEventListener("click", () => activateTab("images"));
 tabs.intel.addEventListener("click", () => activateTab("intel"));
 
 downloadBtn.addEventListener("click", downloadVideo);
@@ -861,6 +1105,8 @@ downloadAudioBtn.addEventListener("click", downloadAudio);
 if (smallFileToggle) smallFileToggle.addEventListener("change", refreshVideoOptions);
 cancelVideoBtn.addEventListener("click", () => cancelDownload("video"));
 cancelAudioBtn.addEventListener("click", () => cancelDownload("audio"));
+if (downloadAllImagesBtn) downloadAllImagesBtn.addEventListener("click", downloadAllImages);
+if (cancelImagesBtn) cancelImagesBtn.addEventListener("click", cancelImageDownload);
 getIntelligenceBtn.addEventListener("click", getIntelligence);
 
 // A Vercel/static deployment has no API on its own. Probe the status endpoint

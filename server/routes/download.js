@@ -4,13 +4,13 @@ import { validateDownloadQuery, sanitizeFilename, sanitizeAsciiFilename } from "
 import {
   startVideoDownload,
   startMergeDownload,
-  getVideoInfo,
   classifyYtDlpError,
   buildVideoAttempts,
   runMediaJob,
   cleanupJobDir,
   MIME_BY_EXT,
 } from "../services/ytdlp.js";
+import { getMediaInfo } from "../services/media.js";
 import { getVideoInfoCached } from "../utils/infoCache.js";
 import { recordError } from "../utils/errorLog.js";
 import { startDownload, setPhase, setProgressDetail, completeDownload, failDownload, isActive, removeDownload } from "../utils/downloadStatus.js";
@@ -50,10 +50,15 @@ router.get("/", async (req, res) => {
   setPhase("video", normalizedUrl, "fetching");
   let info;
   try {
-    info = await getVideoInfoCached(normalizedUrl, () => getVideoInfo(normalizedUrl, { signal: infoController.signal }));
+    info = await getVideoInfoCached(normalizedUrl, () => getMediaInfo(normalizedUrl, { signal: infoController.signal }));
     if (clientGone) {
       removeDownload("video", normalizedUrl);
       return;
+    }
+    if ((info.mediaType || "video") !== "video") {
+      const message = "This Facebook link contains images, not a video. Use the Images tab to download them.";
+      failDownload("video", normalizedUrl, message);
+      return res.status(400).json({ error: message, code: "IMAGE_POST" });
     }
     title = info.title;
   } catch (e) {
@@ -104,6 +109,10 @@ router.get("/", async (req, res) => {
     plan = planSet[0] || null;
   }
 
+  // Facebook share links resolve to a different canonical page. The job must
+  // use that resolved URL even though status/cache keys stay on the input URL.
+  const jobUrl = info._downloadUrl || normalizedUrl;
+
   // Ordered fallback chain: preferred source -> fresh retry -> safer
   // selectors -> alternate YouTube player clients (YouTube only).
   const attempts = buildVideoAttempts({ plan, height, formatId, platform });
@@ -148,7 +157,7 @@ router.get("/", async (req, res) => {
       // throttled connections) and mux them locally; everything else is a
       // regular single yt-dlp job.
       if (attempt.merge) {
-        return startMergeDownload(normalizedUrl, {
+        return startMergeDownload(jobUrl, {
           videoSelector: attempt.merge.videoSelector,
           audioSelector: attempt.merge.audioSelector,
           extractorArgs: attempt.extractorArgs || null,
@@ -157,7 +166,7 @@ router.get("/", async (req, res) => {
           audioSize: plan?.audioSize,
         });
       }
-      return startVideoDownload(normalizedUrl, {
+      return startVideoDownload(jobUrl, {
         ...attempt,
         playlistItem: info._playlistItem || null,
       });

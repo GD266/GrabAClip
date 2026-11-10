@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { validateInfoRequest } from "../utils/validation.js";
-import { getVideoInfo } from "../services/ytdlp.js";
+import { getMediaInfo } from "../services/media.js";
 import { getVideoInfoCached } from "../utils/infoCache.js";
 import { recordError } from "../utils/errorLog.js";
 
@@ -16,11 +16,12 @@ router.post("/", async (req, res) => {
   try {
     // Cached so the download click that follows does not pay for a second
     // extraction round trip.
-    const info = await getVideoInfoCached(validation.normalizedUrl, () => getVideoInfo(validation.normalizedUrl));
+    const info = await getVideoInfoCached(validation.normalizedUrl, () => getMediaInfo(validation.normalizedUrl));
 
     // Return expanded fields (optional fields may be null, but do not fail)
     return res.json({
       platform: info.platform,
+      mediaType: info.mediaType || "video",
       videoId: info.videoId,
       title: info.title,
       thumbnail: info.thumbnail,
@@ -39,6 +40,9 @@ router.post("/", async (req, res) => {
       formatsCompatible: info.formatsCompatible,
       audioFormats: info.audioFormats,
       audioSource: info.audioSource,
+      // Public image metadata only; CDN URLs and internal fields stay server-side.
+      imageCount: info.imageCount || 0,
+      images: info.images || [],
     });
   } catch (e) {
     const status = e.status || 500;

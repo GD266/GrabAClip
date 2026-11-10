@@ -3,7 +3,6 @@ import fs from "node:fs";
 import { sanitizeFilename, sanitizeAsciiFilename, detectPlatform, normalizeMediaUrl } from "../utils/validation.js";
 import {
   startAudioDownload,
-  getVideoInfo,
   classifyYtDlpError,
   buildAudioAttempts,
   runMediaJob,
@@ -12,6 +11,7 @@ import {
   AUDIO_FORMAT_IDS,
   AUDIO_MP3_QUALITIES,
 } from "../services/ytdlp.js";
+import { getMediaInfo } from "../services/media.js";
 import { getVideoInfoCached } from "../utils/infoCache.js";
 import { recordError } from "../utils/errorLog.js";
 import { startDownload, setPhase, setProgressDetail, completeDownload, failDownload, isActive, removeDownload } from "../utils/downloadStatus.js";
@@ -28,7 +28,7 @@ router.get("/", async (req, res) => {
   }
   const normalizedUrl = normalizeMediaUrl(url);
   if (!normalizedUrl) {
-    return res.status(400).json({ error: "Unsupported link. Paste a YouTube, X, or Instagram video URL." });
+    return res.status(400).json({ error: "Unsupported link. Paste a YouTube, X, Instagram, or Facebook URL." });
   }
   const platform = detectPlatform(normalizedUrl);
   let format = String(formatParam).toLowerCase().trim();
@@ -69,10 +69,15 @@ router.get("/", async (req, res) => {
   setPhase("audio", normalizedUrl, "fetching");
   let info;
   try {
-    info = await getVideoInfoCached(normalizedUrl, () => getVideoInfo(normalizedUrl, { signal: infoController.signal }));
+    info = await getVideoInfoCached(normalizedUrl, () => getMediaInfo(normalizedUrl, { signal: infoController.signal }));
     if (clientGone) {
       removeDownload("audio", normalizedUrl);
       return;
+    }
+    if ((info.mediaType || "video") !== "video") {
+      const message = "This Facebook link contains images and has no audio to extract.";
+      failDownload("audio", normalizedUrl, message);
+      return res.status(400).json({ error: message, code: "IMAGE_POST" });
     }
     title = info.title;
   } catch (e) {
@@ -96,6 +101,7 @@ router.get("/", async (req, res) => {
   }
 
   const sourceFormatId = info._audioSourceId || null;
+  const jobUrl = info._downloadUrl || normalizedUrl;
 
   // Ordered fallback chain: preferred source -> fresh retry -> audio-only
   // fallbacks. YouTube additionally gets alternate player clients.
@@ -136,7 +142,7 @@ router.get("/", async (req, res) => {
 
   const result = await runMediaJob({
     attempts,
-    startJob: (attempt) => startAudioDownload(normalizedUrl, {
+    startJob: (attempt) => startAudioDownload(jobUrl, {
       ...attempt,
       format,
       quality,

@@ -215,8 +215,6 @@ export async function getTranscript(rawUrl, options = {}) {
       "--output",
       path.join(tmpDir, "%(id)s.%(ext)s"),
       "--no-playlist",
-      "--remote-components",
-      "ejs:github",
       "--no-warnings",
       "--no-progress",
       "--socket-timeout",

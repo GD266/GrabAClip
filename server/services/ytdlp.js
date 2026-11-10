@@ -10,12 +10,17 @@ import { resolveCookies, COOKIE_TEMP_ROOT } from "../utils/cookies.js";
 
 const YTDLP_BIN = process.env.YTDLP_BIN || "yt-dlp";
 
-// Per-attempt and overall budgets for /api/info. The old setup allowed four
-// 30s attempts (~120s worst case); Render requests were observed hanging for
-// ~95s before returning a generic 500. A slow first extraction still gets a
-// second chance, but the whole lookup is now bounded.
-const INFO_TIMEOUT_MS = 20000; // 20s per player/extraction attempt
-const INFO_TOTAL_TIMEOUT_MS = 45000; // hard ceiling across all attempts
+// Per-attempt and overall budgets for /api/info.
+//
+// The original setup allowed four 30s attempts (~120s worst case), and Render
+// requests were observed hanging for ~95s before a generic 500. A 20s cap was
+// then tried, but it is too short on a 0.1-CPU Render instance: signed-in
+// YouTube extraction runs a JS challenge through Deno and can take 30-50s
+// there. 60s gives the first attempt a real chance while still bounding the
+// whole lookup. If the first attempt fails fast (bot check / no formats), the
+// remaining budget is used for alternate player clients.
+const INFO_TIMEOUT_MS = 60000; // 60s per player/extraction attempt
+const INFO_TOTAL_TIMEOUT_MS = 60000; // hard ceiling across all attempts
 const INFO_RETRY_DELAY_MS = 250;
 const DOWNLOAD_TIMEOUT_MS = 1200000; // 20min (1080p HLS can be large + slow links)
 
@@ -144,15 +149,17 @@ export const MIME_BY_EXT = {
 // `--no-warnings` is intentionally absent: yt-dlp reports stale/rotated
 // cookies as a warning, and suppressing it hid the real cause behind a
 // generic bot-check error. Warnings go to stderr; the JSON payload is stdout.
-const YTDLP_QUIET_FLAGS = ["--no-playlist", "--remote-components", "ejs:github", "--no-progress", ...cookiesFlags()];
+//
+// `--remote-components ejs:github` is intentionally absent too: the Docker
+// image installs `yt-dlp[default]`, which includes the `yt-dlp-ejs` package,
+// so yt-dlp solves JS challenges locally without fetching from GitHub.
+const YTDLP_QUIET_FLAGS = ["--no-playlist", "--no-progress", ...cookiesFlags()];
 
 // Flags for media jobs: progress lines are parsed to feed the UI status.
 // Note: the "download:" prefix of --progress-template is the template TYPE,
 // so the printed line is "<format>" only (e.g. "GACDL  12.3%").
 const YTDLP_JOB_FLAGS = [
   "--no-playlist",
-  "--remote-components",
-  "ejs:github",
   "--newline",
   // Pull HLS/DASH fragments in parallel: single YouTube connections are
   // bandwidth-throttled, and multi-fragment downloads are much faster for
@@ -229,6 +236,9 @@ export function classifyYtDlpError(stderr, code, options = {}) {
     lower.includes("requested content is not available") ||
     lower.includes("this post is unavailable") ||
     lower.includes("post is unavailable") ||
+    lower.includes("this content isn't available") ||
+    lower.includes("content isn't available") ||
+    lower.includes("content is not available") ||
     lower.includes("media not found")
   ) {
     return { status: 404, code: "POST_UNAVAILABLE", message: "This post is unavailable or contains no downloadable video." };
@@ -322,7 +332,12 @@ export function classifyYtDlpError(stderr, code, options = {}) {
     return { status: 400, code: "LIVE_UNSUPPORTED", message: "Live streams and premieres are not supported." };
   }
   if (lower.includes("no video formats found")) {
-    return { status: 400, code: "NO_VIDEO_FORMATS", message: "No downloadable video was found in this link. Try a reel or video post." };
+    return {
+      status: 400,
+      code: "NO_VIDEO_FORMATS",
+      message:
+        "No downloadable video was found in this link. For a public Facebook photo or image post, use the Images tab.",
+    };
   }
   if (
     lower.includes("requested format is not available") ||
@@ -341,7 +356,7 @@ export function classifyYtDlpError(stderr, code, options = {}) {
     return { status: 429, code: "RATE_LIMITED", message: "The platform is rate-limiting this server. Wait a minute and try again." };
   }
   if (lower.includes("unsupported url")) {
-    return { status: 400, code: "UNSUPPORTED_URL", message: "Unsupported link. Paste a YouTube, X, or Instagram video URL." };
+    return { status: 400, code: "UNSUPPORTED_URL", message: "Unsupported link. Paste a YouTube, X, Instagram, or Facebook URL." };
   }
   if (lower.includes("unable to extract") || lower.includes("extraction failed")) {
     return {
@@ -515,6 +530,18 @@ function exactSize(f) {
 function isTwitterProgressive(f) {
   const id = String(f.format_id || "");
   return /^http-/i.test(id) && Boolean(f.height) && String(f.ext || "").toLowerCase() === "mp4";
+}
+
+/**
+ * Older Facebook posts publish only the legacy `sd`/`hd` progressive MP4s.
+ * They omit width/height and codec metadata but are normal muxed H.264/AAC
+ * files, so they can still serve as a video and audio source.
+ */
+function isFacebookLegacyFormat(f) {
+  return (
+    String(f.ext || "").toLowerCase() === "mp4" &&
+    ["hd", "sd"].includes(String(f.format_id || "").toLowerCase())
+  );
 }
 
 function isMuxedFormat(f) {
@@ -883,6 +910,58 @@ export function buildGenericVideoFormats(rawFormats, duration = null) {
   return plans;
 }
 
+/**
+ * Facebook format planning.
+ *
+ * Facebook's DASH renditions expose real width/height, so the generic planner
+ * covers most videos. Some older posts only publish the legacy `sd`/`hd`
+ * progressive files, which omit dimensions and codec metadata even though the
+ * downloaded file is a normal muxed MP4. Those become a single "Source
+ * quality" plan instead of disappearing from the UI.
+ */
+export function buildFacebookVideoFormats(rawFormats, duration = null, options = {}) {
+  const plans = buildGenericVideoFormats(rawFormats, duration);
+  if (plans.length > 0 || !Array.isArray(rawFormats)) return plans;
+
+  const usable = rawFormats.filter(
+    (f) => f && f.ext === "mp4" && ["hd", "sd"].includes(String(f.format_id || "").toLowerCase())
+  );
+  const hd = usable.find((f) => String(f.format_id).toLowerCase() === "hd");
+  const sd = usable.find((f) => String(f.format_id).toLowerCase() === "sd");
+  const source = hd || sd;
+  if (!source) return [];
+
+  // yt-dlp reports acodec "none" for silent media. Legacy files usually omit
+  // the field entirely, so only an explicit "none" disables audio.
+  const hasAudio = options.hasAudio !== false;
+
+  return [
+    {
+      // Legacy Facebook files do not report dimensions. 720 is a safe UI key
+      // (the quality grid is keyed by number); the label stays honest.
+      height: 720,
+      label: "Source quality",
+      displayLabel: "Source quality",
+      ext: "mp4",
+      hasAudio,
+      kind: "muxed",
+      source: "progressive",
+      codecLabel: "H.264",
+      formatId: source.format_id,
+      formatIds: [source.format_id],
+      vcodec: source.vcodec && source.vcodec !== "none" ? source.vcodec : null,
+      acodec: hasAudio ? (source.acodec && source.acodec !== "none" ? source.acodec : "aac") : null,
+      fps: source.fps || null,
+      estimatedSize: estimateSize(source, duration),
+      selectors: [
+        source.format_id,
+        ...(source === hd && sd ? [sd.format_id] : []),
+        "best",
+      ],
+    },
+  ];
+}
+
 /** Always-available audio options (see AUDIO_OPTIONS). */
 export function buildAudioFormats() {
   return AUDIO_OPTIONS.map((o) => ({ ...o }));
@@ -893,8 +972,9 @@ export function buildAudioFormats() {
  * Prefers the smallest HLS variant carrying AAC-LC audio, then any HLS
  * variant, then DASH bestaudio.
  */
-export function pickAudioSource(rawFormats) {
+export function pickAudioSource(rawFormats, options = {}) {
   if (!Array.isArray(rawFormats)) return null;
+  const { allowLegacy = true } = options;
 
   const hlsAudio = rawFormats.filter(
     (f) => isHls(f) && f.acodec && f.acodec !== "none" && f.height
@@ -957,6 +1037,29 @@ export function pickAudioSource(rawFormats) {
     };
   }
 
+  // Legacy Facebook `sd`/`hd` files are muxed MP4s without dimensions. Only
+  // use them when the post exposes no dimensioned video renditions: a silent
+  // Reel lists DASH video-only formats (and no audio-only format) alongside
+  // its legacy files, so treating those as audio would advertise a silent
+  // track. Legacy-only posts have no dimensioned formats at all.
+  const hasDimensionedVideo = rawFormats.some(
+    (f) => f.height && f.vcodec && f.vcodec !== "none"
+  );
+  const legacy = allowLegacy && !hasDimensionedVideo
+    ? rawFormats
+        .filter(isFacebookLegacyFormat)
+        .sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0]
+    : null;
+  if (legacy) {
+    return {
+      formatId: legacy.format_id,
+      height: null,
+      ext: "mp4",
+      acodec: "aac",
+      label: "Facebook source audio",
+    };
+  }
+
   return null;
 }
 
@@ -974,19 +1077,20 @@ export async function getVideoInfo(rawUrl, options = {}) {
   }
   const platform = detectPlatform(rawUrl);
   if (!platform || !isSupportedMediaUrl(rawUrl)) {
-    const err = new Error("Unsupported link. Paste a YouTube, X, or Instagram video URL.");
+    const err = new Error("Unsupported link. Paste a YouTube, X, Instagram, or Facebook URL.");
     err.status = 400;
     throw err;
   }
 
   const url = normalizeMediaUrl(rawUrl);
   const isYouTube = platform === "youtube";
+  const isFacebook = platform === "facebook";
 
   const baseArgs = [
     ...YTDLP_QUIET_FLAGS,
     "--dump-json",
     "--socket-timeout",
-    "15",
+    "20",
     "--retries",
     "1",
   ];
@@ -1011,17 +1115,33 @@ export async function getVideoInfo(rawUrl, options = {}) {
     if (remaining <= 0) break;
 
     attempts += 1;
+    const startedAt = Date.now();
+    const clientLabel = playerClient || (isYouTube ? "default" : "fresh");
     const args = [...baseArgs];
     if (playerClient) args.push("--extractor-args", `youtube:player_client=${playerClient}`);
     args.push(url);
 
     try {
       result = await execYtDlp(args, Math.min(INFO_TIMEOUT_MS, remaining), signal);
+      if (attempts > 1) {
+        console.log(
+          `[info] ${platform} extraction succeeded via ${clientLabel} in ${Date.now() - startedAt}ms (attempt ${attempts})`
+        );
+      }
       break;
     } catch (e) {
       if (e.code === "ABORTED" || e.status === 499) throw e;
       if (e.status) throw e;
       lastError = e;
+
+      // Per-attempt timing makes slow CPU/JS-challenge hosts visible in the
+      // service log without exposing cookie contents.
+      const elapsed = Date.now() - startedAt;
+      const firstLine = String(e.stderr || e.message || "").trim().split("\n")[0].slice(0, 180);
+      console.warn(
+        `[info] ${platform} extraction failed via ${clientLabel} after ${elapsed}ms (attempt ${attempts}): ${e.code || "ERROR"} ${firstLine}`
+      );
+
       if (isFatalDownloadError(e.stderr || e.message)) break;
 
       const wait = deadline - Date.now();
@@ -1101,21 +1221,26 @@ export async function getVideoInfo(rawUrl, options = {}) {
   }
 
   // YouTube keeps its size-optimised + compatibility plan sets. X/Instagram
-  // are planned from their direct renditions.
+  // are planned from their direct renditions. Facebook may additionally expose
+  // legacy `sd`/`hd` files without dimensions.
   const formats = isYouTube
     ? buildVideoFormats(data.formats, duration, { preferSize: true })
-    : buildGenericVideoFormats(data.formats, duration);
+    : isFacebook
+      ? buildFacebookVideoFormats(data.formats, duration, { hasAudio: data.acodec !== "none" })
+      : buildGenericVideoFormats(data.formats, duration);
   const formatsCompatible = isYouTube
     ? buildVideoFormats(data.formats, duration)
     : formats;
-  const audioSource = pickAudioSource(data.formats);
+  const audioSource = pickAudioSource(data.formats, { allowLegacy: data.acodec !== "none" });
   const audioFormats = audioSource ? buildAudioFormats() : [];
 
   if (!formats.length) {
     const err = new Error(
       platform === "instagram"
         ? "No downloadable video was found in this Instagram post. Try a reel or video post."
-        : "No downloadable video was found in this link."
+        : platform === "facebook"
+          ? "No downloadable video was found in this Facebook link. It may be a public photo or image post."
+          : "No downloadable video was found in this link."
     );
     err.status = 400;
     throw err;
@@ -1123,6 +1248,7 @@ export async function getVideoInfo(rawUrl, options = {}) {
 
   return {
     platform,
+    mediaType: "video",
     videoId,
     title,
     channel,
@@ -1144,6 +1270,9 @@ export async function getVideoInfo(rawUrl, options = {}) {
     _audioSourceId: audioSource?.formatId || null,
     // Internal: Instagram carousels / multi-media posts.
     _playlistItem: playlistItem,
+    // Internal: the URL the job should use. Facebook share links are resolved
+    // to their real media page before this point.
+    _downloadUrl: url,
     _rawData: {
       tags: data.tags || null,
       categories: data.categories || null,
@@ -1369,6 +1498,10 @@ export function isFatalDownloadError(stderr) {
     s.includes("requested content is not available") ||
     s.includes("this post is unavailable") ||
     s.includes("post is unavailable") ||
+    s.includes("this content isn't available") ||
+    s.includes("this content is not available") ||
+    s.includes("content isn't available") ||
+    s.includes("content is not available") ||
     s.includes("rate-limit") ||
     s.includes("rate limit") ||
     s.includes("too many requests") ||
@@ -1384,7 +1517,7 @@ export function startVideoDownload(rawUrl, options = {}) {
   const { selector, extractorArgs = null, playlistItem = null } = options;
 
   if (!isSupportedMediaUrl(rawUrl)) {
-    const err = new Error("Unsupported link. Paste a YouTube, X, or Instagram video URL.");
+    const err = new Error("Unsupported link. Paste a YouTube, X, Instagram, or Facebook URL.");
     err.status = 400;
     throw err;
   }
@@ -1423,7 +1556,7 @@ export function startAudioDownload(rawUrl, options = {}) {
   const { format = "m4a", quality = null, selector, extractorArgs = null, playlistItem = null } = options;
 
   if (!isSupportedMediaUrl(rawUrl)) {
-    const err = new Error("Unsupported link. Paste a YouTube, X, or Instagram video URL.");
+    const err = new Error("Unsupported link. Paste a YouTube, X, Instagram, or Facebook URL.");
     err.status = 400;
     throw err;
   }
@@ -1507,7 +1640,7 @@ export function startMergeDownload(rawUrl, options = {}) {
   const { videoSelector, audioSelector, extractorArgs = null, playlistItem = null, videoSize = null, audioSize = null } = options;
 
   if (!isSupportedMediaUrl(rawUrl)) {
-    const err = new Error("Unsupported link. Paste a YouTube, X, or Instagram video URL.");
+    const err = new Error("Unsupported link. Paste a YouTube, X, Instagram, or Facebook URL.");
     err.status = 400;
     throw err;
   }

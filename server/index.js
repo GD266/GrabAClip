@@ -8,6 +8,7 @@ import infoRouter from "./routes/info.js";
 import downloadRouter from "./routes/download.js";
 import intelligenceRouter from "./routes/intelligence.js";
 import audioRouter from "./routes/audio.js";
+import { createImageRouter, createImagesZipRouter } from "./routes/image.js";
 import { getActiveDownloads } from "./utils/downloadStatus.js";
 import { recordError } from "./utils/errorLog.js";
 import {
@@ -88,7 +89,10 @@ app.get("/api/downloads/status", (req, res) => {
 // API routes
 app.use("/api/info", infoRouter);
 app.use("/api/download/audio", audioRouter);
+app.use("/api/download/image", createImageRouter({ download: true }));
+app.use("/api/download/images", createImagesZipRouter());
 app.use("/api/download", downloadRouter);
+app.use("/api/image", createImageRouter({ download: false }));
 app.use("/api/intelligence", intelligenceRouter);
 
 // Serve frontend (includes the shared validator at /shared/validator.js).

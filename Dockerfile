@@ -32,6 +32,7 @@ RUN apt-get update \
 ARG YTDLP_VERSION=2026.10.26
 RUN python3 -m pip install --no-cache-dir --break-system-packages "yt-dlp[default]==${YTDLP_VERSION}" \
  && test "$(yt-dlp --version)" = "${YTDLP_VERSION}" \
+ && python3 -c "import importlib.metadata as m; m.version('yt-dlp-ejs')" \
  && yt-dlp --version
 
 COPY --from=deno /deno /usr/local/bin/deno
