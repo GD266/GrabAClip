@@ -7,3 +7,5 @@ node_modules
 *.ytdl
 server.log
 .DS_Store
+cookies.txt
+cookies*.txt
